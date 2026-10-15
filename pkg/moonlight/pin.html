@@ -30,6 +30,23 @@
             font-size: 3rem;
         }
 
+        .user {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+            color: white;
+            font-size: 1.5rem;
+        }
+
+        .user[hidden] {
+            display: none;
+        }
+
+        select {
+            margin-left: 0.5rem;
+            font-size: 1.5rem;
+        }
+
         /* Chrome, Safari, Edge, Opera */
         input::-webkit-outer-spin-button,
         input::-webkit-inner-spin-button {
@@ -47,6 +64,13 @@
 
 
 <div>
+    <p class="user status"></p>
+    <label class="user" id="pending" hidden>Pairing
+        <select></select>
+    </label>
+    <label class="user" id="users" hidden>Pair as
+        <select></select>
+    </label>
     <form class="form">
         <input type="number" min="0" max="9" step="1"/>
         <input type="number" min="0" max="9" step="1"/>
@@ -60,6 +84,57 @@
 <script type="application/javascript">
     const inputs = document.querySelectorAll("input");
     const form = document.querySelector(".form");
+    const status = document.querySelector(".status");
+    const pendingLabel = document.querySelector("#pending");
+    const pendingSelect = pendingLabel.querySelector("select");
+    const userLabel = document.querySelector("#users");
+    const userSelect = userLabel.querySelector("select");
+    const hashSecret = window.location.hash.substring(1);
+    let sent = false;
+
+    // Only ask which user to pair as when there's more than one; with a
+    // single user the server picks it.
+    fetch("/pin/users")
+        .then((res) => res.json())
+        .then(({users}) => {
+            if (users.length < 2) {
+                return;
+            }
+            users.forEach((name) => userSelect.add(new Option(name, name)));
+            userLabel.hidden = false;
+        })
+        .catch(() => {});
+
+    // Without a secret in the URL (e.g. a bookmarked /pin/), offer the
+    // pairings waiting for a PIN, refreshing until the PIN is sent.
+    function refreshPending() {
+        if (sent) {
+            return;
+        }
+        fetch("/pin/pending")
+            .then((res) => res.json())
+            .then(({pending}) => {
+                const selected = pendingSelect.value;
+                pendingSelect.replaceChildren(...pending.map((p) =>
+                    new Option(`${p.deviceName || "Unknown device"} (${p.clientIP})`, p.secret)));
+                if (pending.some((p) => p.secret === selected)) {
+                    pendingSelect.value = selected;
+                }
+                pendingLabel.hidden = pending.length < 2;
+                if (pending.length === 0) {
+                    status.textContent = "Waiting for a Moonlight client to start pairing...";
+                } else if (pending.length === 1) {
+                    status.textContent = `Pairing ${pending[0].deviceName || "Unknown device"} (${pending[0].clientIP})`;
+                } else {
+                    status.textContent = "";
+                }
+            })
+            .catch(() => {})
+            .finally(() => setTimeout(refreshPending, 2000));
+    }
+    if (!hashSecret) {
+        refreshPending();
+    }
 
     function send(pin) {
         let xhr = new XMLHttpRequest();
@@ -72,9 +147,14 @@
         };
         const data = JSON.stringify({
             "pin": pin,
-            "secret": window.location.hash.substring(1)
+            "secret": hashSecret || pendingSelect.value,
+            "user": userSelect.value
         });
+        sent = true;
         form.textContent = "Sending " + pin + " ...";
+        status.textContent = "";
+        pendingLabel.hidden = true;
+        userLabel.hidden = true;
         xhr.send(data);
     }
 

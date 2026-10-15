@@ -7,12 +7,19 @@ on:
   release:
     types: [released]
 
+  workflow_dispatch:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
+  contents: read
   packages: write
+
+env:
+  # Repository variable: Docker Hub namespace (your Docker Hub username or org)
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
 
 jobs:
   build_and_push_containers:
@@ -35,13 +42,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Login to GitHub Container Registry
+      - name: Login to Docker Hub
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: ${{ !github.event.pull_request.head.repo.fork }}
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Generate docker image tags
         id: metadata
@@ -51,7 +57,9 @@ jobs:
             # Disable latest tag
             latest=false
           images: |
-            name=ghcr.io/${{ github.repository_owner }}/fenrir/${{ matrix.app == 'operator' && 'direwolf-operator' || matrix.app }}
+            name=docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.app == 'operator' && 'direwolf-operator' || matrix.app }}
+          tags: |
+            type=sha,prefix=,format=long
 
       - name: Build and push image
         id: build
@@ -159,15 +167,15 @@ jobs:
             VALUES_FILE=charts/direwolf-operator/values.yaml
             
             OP_DIGEST="$(cat operator-artifact/image-digest-operator.txt)"
-            yq e -i ".controllers.direwolf_operator.containers.operator.image.repository = \\"ghcr.io/${{ github.repository_owner }}/fenrir/direwolf-operator\\"" "$VALUES_FILE"
-            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ github.ref_name }}@${OP_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/direwolf-operator\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ github.sha }}@${OP_DIGEST}\\"" "$VALUES_FILE"
             
             AG_DIGEST="$(cat agent-artifact/image-digest-wolf-agent.txt)"
-            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"ghcr.io/${{ github.repository_owner }}/fenrir/wolf-agent:${{ github.ref_name }}@${AG_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/wolf-agent:${{ github.sha }}@${AG_DIGEST}\\"" "$VALUES_FILE"
 
             PX_DIGEST="$(cat proxy-artifact/image-digest-moonlight-proxy.txt)"
-            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ github.ref_name }}@${PX_DIGEST}\\"" "$VALUES_FILE"
-            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.repository = \\"ghcr.io/${{ github.repository_owner }}/fenrir/moonlight-proxy\\"" "$VALUES_FILE"
+            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ github.sha }}@${PX_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/moonlight-proxy\\"" "$VALUES_FILE"
             
             echo "Updated $VALUES_FILE"
 
