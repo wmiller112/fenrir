@@ -2,7 +2,7 @@ name: Build and Push Docker Images
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
 
   release:
     types: [released]
@@ -22,8 +22,26 @@ env:
   DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
 
 jobs:
+  image_tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute image tag (<branch>-<sha>)
+        id: tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Docker tags allow [A-Za-z0-9_.-], max 128 chars, and can't start with . or -
+          slug="$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed -E 's/^[.-]+//' | cut -c1-80)"
+          echo "tag=${slug}-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${slug}-${SHA}"
+
   build_and_push_containers:
     runs-on: ubuntu-latest
+    needs: image_tag
     strategy:
       matrix:
         app:
@@ -59,7 +77,7 @@ jobs:
           images: |
             name=docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.app == 'operator' && 'direwolf-operator' || matrix.app }}
           tags: |
-            type=sha,prefix=,format=long
+            type=raw,value=${{ needs.image_tag.outputs.tag }}
 
       - name: Build and push image
         id: build
@@ -88,7 +106,7 @@ jobs:
 
   build_and_push_chart:
     runs-on: ubuntu-latest
-    needs: build_and_push_containers
+    needs: [image_tag, build_and_push_containers]
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -168,13 +186,13 @@ jobs:
             
             OP_DIGEST="$(cat operator-artifact/image-digest-operator.txt)"
             yq e -i ".controllers.direwolf_operator.containers.operator.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/direwolf-operator\\"" "$VALUES_FILE"
-            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ github.sha }}@${OP_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ needs.image_tag.outputs.tag }}@${OP_DIGEST}\\"" "$VALUES_FILE"
             
             AG_DIGEST="$(cat agent-artifact/image-digest-wolf-agent.txt)"
-            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/wolf-agent:${{ github.sha }}@${AG_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/wolf-agent:${{ needs.image_tag.outputs.tag }}@${AG_DIGEST}\\"" "$VALUES_FILE"
 
             PX_DIGEST="$(cat proxy-artifact/image-digest-moonlight-proxy.txt)"
-            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ github.sha }}@${PX_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ needs.image_tag.outputs.tag }}@${PX_DIGEST}\\"" "$VALUES_FILE"
             yq e -i ".controllers.moonlight_proxy.containers.proxy.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/moonlight-proxy\\"" "$VALUES_FILE"
             
             echo "Updated $VALUES_FILE"
