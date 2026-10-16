@@ -591,7 +591,8 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 						WithPorts(
 							v1ac.ServicePort().
 								WithName("wa"). // wolf-agent
-								WithPort(8443),
+								WithPort(wolfAgentServicePort(session.Status.Ports)).
+								WithTargetPort(intstr.FromInt32(wolfAgentPort)),
 							v1ac.ServicePort().
 								WithName("rtsp"). // moonlight-rtsp
 								WithPort(session.Status.Ports.RTSP),
@@ -1621,6 +1622,20 @@ func portsForSlot(slot int32) v1alpha1types.SessionPorts {
 	}
 }
 
+// Port wolf-agent listens on inside the session pod
+const wolfAgentPort = 8443
+
+// wolfAgentServicePort is wolf-agent's port on the session's Service. It
+// differs per slot like the stream ports: MetalLB and Cilium only share the
+// LoadBalancer IP between Services whose ports don't overlap.
+func wolfAgentServicePort(ports v1alpha1types.SessionPorts) int32 {
+	slot, ok := portSlotOf(ports)
+	if !ok {
+		return wolfAgentPort
+	}
+	return wolfAgentPort + slot
+}
+
 // portSlotOf returns the slot ports were allocated from, if they were
 func portSlotOf(ports v1alpha1types.SessionPorts) (int32, bool) {
 	if ports.RTSP < basePorts.RTSP || (ports.RTSP-basePorts.RTSP)%portSlotStride != 0 {
@@ -1660,7 +1675,7 @@ func (c *SessionController) reconcileActiveStreams(
 	// Ensure they match each of our k8s sessions. Hash on AESKey/IV
 	// In the future it might make sense to just match on ClientID/ClientCertFingerprint
 	// but that is hardcoded for now :)
-	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:8443", service.Spec.ClusterIP), &http.Client{
+	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, wolfAgentServicePort(session.Status.Ports)), &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
