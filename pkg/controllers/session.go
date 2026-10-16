@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"encoding/json"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -29,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
@@ -718,22 +721,28 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	// of them, like the first player leaving a co-op game
 	owners := c.sessionOwners(session)
 
-	// If deployment already exists, just update its owners
+	// If deployment already exists, just update its owners. Patch rather
+	// than apply: the cache may still hold a deployment that was just
+	// garbage collected with its last session, and apply would try to
+	// recreate it from the owners alone.
 	deploymentName := c.deploymentName(session)
 	if _, err := c.deploymentController.Informer().Namespaced(session.Namespace).Get(deploymentName); err == nil {
 		klog.Infof("Deployment %s/%s already exists, just updating metadata", session.Namespace, deploymentName)
-		_, err := c.K8sClient.AppsV1().Deployments(session.Namespace).Apply(
-			ctx,
-			appsv1ac.Deployment(deploymentName, session.Namespace).
-				WithOwnerReferences(ownerApplyConfigs(owners)...),
-			metav1.ApplyOptions{
-				FieldManager: "direwolf-session-controller-deployment-owners",
-			})
+		patch, err := json.Marshal(map[string]any{
+			"metadata": map[string]any{"ownerReferences": owners},
+		})
 		if err != nil {
+			return fmt.Errorf("failed to encode owners patch: %w", err)
+		}
+		_, err = c.K8sClient.AppsV1().Deployments(session.Namespace).Patch(
+			ctx, deploymentName, types.MergePatchType, patch, metav1.PatchOptions{})
+		if err == nil {
+			return nil
+		}
+		if !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to update owners of deployment %s: %w", deploymentName, err)
 		}
-
-		return nil
+		klog.Infof("Deployment %s/%s is gone, creating it again", session.Namespace, deploymentName)
 	}
 
 	coop := c.coopConfig(session)
@@ -1719,7 +1728,10 @@ func (c *SessionController) reconcileActiveStreams(
 		return fmt.Errorf("failed to get deployment: %s", err)
 	}
 
+	// A deployment that was just created reports 0/0 replicas, which isn't
+	// ready: wolf-agent's service has no endpoints yet
 	if deployment.Status.ObservedGeneration != deployment.Generation ||
+		deployment.Status.ReadyReplicas < ptr.Deref(deployment.Spec.Replicas, 1) ||
 		deployment.Status.ReadyReplicas != deployment.Status.Replicas {
 		return fmt.Errorf("deployment %s/%s not ready (Observed %d, Latest %d) (%d/%d)", session.Namespace, deploymentName, deployment.Status.ObservedGeneration, deployment.Generation, deployment.Status.ReadyReplicas, deployment.Status.Replicas)
 	}
@@ -1734,8 +1746,14 @@ func (c *SessionController) reconcileActiveStreams(
 	// Ensure they match each of our k8s sessions. Hash on AESKey/IV
 	// In the future it might make sense to just match on ClientID/ClientCertFingerprint
 	// but that is hardcoded for now :)
+	//
+	// Calls time out rather than holding up the session's reconcile: the
+	// workqueue doesn't rerun it in the meantime, and Moonlight gives up on
+	// the launch after 25s. Creating a lobby takes Wolf up to 20s.
 	wolfclient := wolfapi.NewClient(fmt.Sprintf("https://%s:%d", service.Spec.ClusterIP, wolfAgentServicePort(session.Status.Ports)), &http.Client{
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
+			DialContext:     (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	})
@@ -1901,7 +1919,7 @@ func (c *SessionController) reconcileActiveStreams(
 	session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", service.Spec.ClusterIP, session.Status.Ports.RTSP)
 
 	if coop := app.Spec.Coop; coop != nil {
-		if err := c.reconcileLobby(ctx, wolfclient, session, app, coop); err != nil {
+		if err := c.reconcileLobby(ctx, wolfclient, session, app, coop, wolfRenderNode(deployment)); err != nil {
 			return fmt.Errorf("failed to join co-op lobby: %w", err)
 		}
 	}
@@ -1925,6 +1943,25 @@ var coopLobbyRunCmd = fmt.Sprintf(
 	coopWaylandDisplay, coopSinkFile,
 )
 
+// wolfRenderNode is the render node the pod's Wolf uses for its sessions, which
+// the lobby's compositor must use too: another GPU may not even support GBM,
+// like NVIDIA cards next to an iGPU.
+func wolfRenderNode(deployment *appsv1.Deployment) string {
+	renderNode := "/dev/dri/renderD128" // Wolf's default
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		if container.Name != "wolf" {
+			continue
+		}
+		// Later entries win, like user sidecar policies over app settings
+		for _, env := range container.Env {
+			if env.Name == "WOLF_RENDER_NODE" && env.Value != "" {
+				renderNode = env.Value
+			}
+		}
+	}
+	return renderNode
+}
+
 func coopLobbyName(app *v1alpha1types.App) string {
 	return "direwolf-" + app.Name
 }
@@ -1938,6 +1975,7 @@ func (c *SessionController) reconcileLobby(
 	session *v1alpha1types.Session,
 	app *v1alpha1types.App,
 	coop *v1alpha1types.CoopConfig,
+	renderNode string,
 ) error {
 	if session.Status.WolfSessionID == "" {
 		return fmt.Errorf("session has no wolf session yet")
@@ -1967,10 +2005,6 @@ func (c *SessionController) reconcileLobby(
 	}
 
 	if lobbyID == "" {
-		renderNode := "/dev/dri/renderD128"
-		if vars := app.Spec.WolfConfig.RuntimeVariables; vars != nil && vars.RenderNode != "" {
-			renderNode = vars.RenderNode
-		}
 		caps := coop.VideoProducerBufferCaps
 		if caps == "" {
 			caps = "video/x-raw"

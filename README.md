@@ -100,7 +100,8 @@ streams the same running instance, for games without netplay like PS2
   first player leaving, and it uses the resources, volumes and sidecar
   policies of the user who started it.
 - The operator creates a Wolf lobby named `direwolf-<app>` and joins each
-  session's Wolf session to it. Wolf then streams the lobby's display to every
+  session's Wolf session to it, on the render node the pod's Wolf uses
+  (`WOLF_RENDER_NODE`). Wolf then streams the lobby's display to every
   client and routes all their inputs to it, and stops the lobby once everyone
   has left.
 - The game runs as the pod's own container, not as Wolf's runner, so the

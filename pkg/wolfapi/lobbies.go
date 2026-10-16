@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // Lobby is one running app that several Wolf sessions stream from and
@@ -107,9 +108,8 @@ func (c *client) CreateLobby(ctx context.Context, lobby CreateLobbyRequest) (str
 // Switches the session's stream and input over to the lobby.
 func (c *client) JoinLobby(ctx context.Context, lobbyID, sessionID string) error {
 	type JoinLobbyRequest struct {
-		LobbyID string `json:"lobby_id"`
-		// Wolf takes the session ID as a number here, unlike other endpoints
-		MoonlightSessionID uint64 `json:"moonlight_session_id"`
+		LobbyID            string `json:"lobby_id"`
+		MoonlightSessionID any    `json:"moonlight_session_id"`
 	}
 
 	id, err := strconv.ParseUint(sessionID, 10, 64)
@@ -117,12 +117,21 @@ func (c *client) JoinLobby(ctx context.Context, lobbyID, sessionID string) error
 		return fmt.Errorf("invalid wolf session ID %q: %w", sessionID, err)
 	}
 
+	// Wolf builds disagree on the session ID's type here: wolf:stable wants
+	// a string, while some source versions take a number. Try the string
+	// first and fall back if Wolf can't parse it.
 	var joinResp Response
-	if err := c.post(ctx, "/api/v1/lobbies/join", JoinLobbyRequest{
-		LobbyID:            lobbyID,
-		MoonlightSessionID: id,
-	}, &joinResp); err != nil {
-		return err
+	for _, sessionIDValue := range []any{sessionID, id} {
+		joinResp = Response{}
+		if err := c.post(ctx, "/api/v1/lobbies/join", JoinLobbyRequest{
+			LobbyID:            lobbyID,
+			MoonlightSessionID: sessionIDValue,
+		}, &joinResp); err != nil {
+			return err
+		}
+		if joinResp.Success || !strings.Contains(joinResp.Error, "moonlight_session_id") {
+			break
+		}
 	}
 
 	if !joinResp.Success {

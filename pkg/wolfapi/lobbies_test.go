@@ -95,8 +95,8 @@ func TestCreateAndJoinLobby(t *testing.T) {
 		t.Fatalf("JoinLobby: %v", err)
 	}
 	joined := bodies["/api/v1/lobbies/join"]
-	// Wolf only accepts the session ID as a number here
-	if joined["lobby_id"] != "abc" || joined["moonlight_session_id"] != 4815162342.0 {
+	// wolf:stable takes the session ID as a string here
+	if joined["lobby_id"] != "abc" || joined["moonlight_session_id"] != "4815162342" {
 		t.Errorf("unexpected join body %v", joined)
 	}
 
@@ -121,5 +121,30 @@ func TestLobbyErrors(t *testing.T) {
 	}
 	if err := client.JoinLobby(ctx, "nope", "1"); err == nil {
 		t.Error("JoinLobby succeeded on an error reply")
+	}
+}
+
+func TestJoinLobbyNumericSessionIDFallback(t *testing.T) {
+	var sent []any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = append(sent, body["moonlight_session_id"])
+		// Like a Wolf build that only accepts the session ID as a number
+		if _, ok := body["moonlight_session_id"].(float64); !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"success":false,"error":"Failed to parse field 'moonlight_session_id': Could not cast to unsigned long."}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"success":true}`)
+	}))
+	t.Cleanup(srv.Close)
+	client := wolfapi.NewClient(srv.URL, srv.Client())
+
+	if err := client.JoinLobby(context.Background(), "abc", "42"); err != nil {
+		t.Fatalf("JoinLobby: %v", err)
+	}
+	if len(sent) != 2 || sent[0] != "42" || sent[1] != 42.0 {
+		t.Errorf("sent session IDs %v, want the string then the number", sent)
 	}
 }

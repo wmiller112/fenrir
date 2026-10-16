@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/r3labs/sse/v2"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,7 +157,7 @@ func TestReconcileLobby(t *testing.T) {
 	alex.Status.WolfSessionID = "111"
 
 	// The first player creates the lobby and joins it
-	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop); err != nil {
+	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
 		t.Fatalf("reconcileLobby(alex): %v", err)
 	}
 	if len(wolf.created) != 1 {
@@ -177,11 +178,11 @@ func TestReconcileLobby(t *testing.T) {
 	// The second player joins the running lobby
 	player2 := testSession("player2-1", "player2", "ps2", v1alpha1types.SessionPorts{})
 	player2.Status.WolfSessionID = "222"
-	if err := c.reconcileLobby(ctx, wolf, player2, app, app.Spec.Coop); err != nil {
+	if err := c.reconcileLobby(ctx, wolf, player2, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
 		t.Fatalf("reconcileLobby(player2): %v", err)
 	}
 	// Reconciling again doesn't rejoin
-	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop); err != nil {
+	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
 		t.Fatalf("reconcileLobby(alex) again: %v", err)
 	}
 
@@ -195,20 +196,19 @@ func TestReconcileLobby(t *testing.T) {
 
 	// Without a Wolf session there is nothing to join yet
 	pending := testSession("player3-1", "player3", "ps2", v1alpha1types.SessionPorts{})
-	if err := c.reconcileLobby(ctx, wolf, pending, app, app.Spec.Coop); err == nil {
+	if err := c.reconcileLobby(ctx, wolf, pending, app, app.Spec.Coop, "/dev/dri/renderD128"); err == nil {
 		t.Error("reconcileLobby without a wolf session succeeded")
 	}
 }
 
 func TestReconcileLobbyCustomCaps(t *testing.T) {
 	app := testApp("ps2", &v1alpha1types.CoopConfig{VideoProducerBufferCaps: "video/x-raw(memory:CUDAMemory)"})
-	app.Spec.WolfConfig.RuntimeVariables = &v1alpha1types.RuntimeWolfVariables{RenderNode: "/dev/dri/renderD129"}
 	c := newCoopTestController(t)
 	wolf := &fakeWolf{}
 
 	s := testSession("alex-1", "alex", "ps2", v1alpha1types.SessionPorts{})
 	s.Status.WolfSessionID = "1"
-	if err := c.reconcileLobby(context.Background(), wolf, s, app, app.Spec.Coop); err != nil {
+	if err := c.reconcileLobby(context.Background(), wolf, s, app, app.Spec.Coop, "/dev/dri/renderD129"); err != nil {
 		t.Fatalf("reconcileLobby: %v", err)
 	}
 
@@ -218,6 +218,29 @@ func TestReconcileLobbyCustomCaps(t *testing.T) {
 	}
 	if v.WaylandRenderNode != "/dev/dri/renderD129" || v.RunnerRenderNode != "/dev/dri/renderD129" {
 		t.Errorf("render nodes = %q, %q", v.WaylandRenderNode, v.RunnerRenderNode)
+	}
+}
+
+func TestWolfRenderNode(t *testing.T) {
+	deployment := func(env ...corev1.EnvVar) *appsv1.Deployment {
+		d := &appsv1.Deployment{}
+		d.Spec.Template.Spec.Containers = []corev1.Container{
+			{Name: "app", Env: []corev1.EnvVar{{Name: "WOLF_RENDER_NODE", Value: "/dev/dri/renderD200"}}},
+			{Name: "wolf", Env: env},
+		}
+		return d
+	}
+
+	if got := wolfRenderNode(deployment()); got != "/dev/dri/renderD128" {
+		t.Errorf("without WOLF_RENDER_NODE got %q, want Wolf's default", got)
+	}
+	// The app's runtime variable, then a user's sidecar policy overriding it
+	got := wolfRenderNode(deployment(
+		corev1.EnvVar{Name: "WOLF_RENDER_NODE", Value: "/dev/dri/renderD128"},
+		corev1.EnvVar{Name: "WOLF_RENDER_NODE", Value: "/dev/dri/renderD129"},
+	))
+	if got != "/dev/dri/renderD129" {
+		t.Errorf("got %q, want the last WOLF_RENDER_NODE of the wolf container", got)
 	}
 }
 
