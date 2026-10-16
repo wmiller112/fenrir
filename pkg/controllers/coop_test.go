@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -384,5 +385,26 @@ func TestWolfSeedConfig(t *testing.T) {
 	// It's written with a quoted heredoc in the init container
 	if strings.Contains(cfg, "DIREWOLF_EOF") {
 		t.Error("seed config contains the heredoc delimiter")
+	}
+}
+
+func TestRTSPFakeIP(t *testing.T) {
+	alex := testSession("alex-1", "alex", "ps2", v1alpha1types.SessionPorts{})
+	player2 := testSession("player2-1", "player2", "ps2", v1alpha1types.SessionPorts{})
+
+	ip := rtspFakeIP(alex, sets.New[string]())
+	if net.ParseIP(ip).To4() == nil {
+		t.Fatalf("got %q, want an IPv4 address", ip)
+	}
+	if again := rtspFakeIP(alex, sets.New[string]()); again != ip {
+		t.Errorf("not stable: %q then %q", ip, again)
+	}
+	// Wolf matches RTSP requests to sessions by it, so a pod's sessions
+	// must not share one
+	if other := rtspFakeIP(player2, sets.New(ip)); other == ip {
+		t.Errorf("player2 got alex's %q", ip)
+	}
+	if taken := rtspFakeIP(alex, sets.New(ip)); taken == ip || net.ParseIP(taken).To4() == nil {
+		t.Errorf("with %q taken got %q", ip, taken)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"encoding/json"
+	"hash/fnv"
 	"maps"
 	"net"
 	"net/http"
@@ -1915,6 +1916,12 @@ func (c *SessionController) reconcileActiveStreams(
 			klog.Warningf("Wolf of %s has no player slots, session %s/%s gets the shared default ID", deploymentName, session.Namespace, session.Name)
 		}
 
+		takenIPs := sets.New[string]()
+		for _, s := range sessions {
+			takenIPs.Insert(s.RTSPFakeIP)
+		}
+		fakeIP := rtspFakeIP(session, takenIPs)
+
 		sessionID, err := wolfclient.AddSession(ctx, wolfapi.Session{
 			ClientID:          clientID,
 			VideoWidth:        session.Spec.Config.VideoWidth,
@@ -1936,26 +1943,24 @@ func (c *SessionController) reconcileActiveStreams(
 			},
 			AESKey: session.Spec.Config.AESKey,
 			AESIV:  session.Spec.Config.AESIV,
-			//!TODO: not this. This is the hash of the client cert we are
-			// hardcoding into wolf config. Should call pair endpoint to genuinely
-			// add it. Though not really needed since user doesnt connect via HTTPS
-			// to wolf, we just need a client ID wolf accepts for this specific
-			// pairing/client...
-			// ClientID:   "4193251087262667199",
-			RTSPFakeIP: service.Spec.ClusterIP,
+			RTSPFakeIP: fakeIP,
 		})
 
 		if err != nil {
 			return fmt.Errorf("failed to create session: %s", err)
 		}
 		session.Status.WolfSessionID = sessionID
+		session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", fakeIP, session.Status.Ports.RTSP)
 	} else {
 		//!TODO: Update wolf API to include session ID in list so we can update
 		// these details/validate discrepencies
 		// assert wolf session ID non-empty and matches what we expect
 	}
 
-	session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", service.Spec.ClusterIP, session.Status.Ports.RTSP)
+	if session.Status.StreamURL == "" {
+		// Added by an older operator, which used the service's address
+		session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", service.Spec.ClusterIP, session.Status.Ports.RTSP)
+	}
 
 	if coop := app.Spec.Coop; coop != nil {
 		if err := c.ensureLobby(ctx, wolfclient, session, app, coop, wolfRenderNode(deployment)); err != nil {
@@ -1987,6 +1992,23 @@ func wolfSeedConfig(serverUUID string) string {
 		fmt.Fprintf(&b, "\n[[paired_clients]]\nclient_cert = %q\napp_state_folder = %q\n", name, name)
 	}
 	return b.String()
+}
+
+// rtspFakeIP is the address in a session's RTSP URL. Wolf tells sessions apart
+// by the host in the URL their client sends, while Moonlight only takes the
+// port from it and connects to the server it paired with. Sessions sharing a
+// pod need distinct ones, which taken holds.
+func rtspFakeIP(session *v1alpha1types.Session, taken sets.Set[string]) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(session.UID))
+	for {
+		v := h.Sum32()
+		ip := fmt.Sprintf("10.%d.%d.%d", byte(v>>16), byte(v>>8), byte(v))
+		if !taken.Has(ip) {
+			return ip
+		}
+		_, _ = h.Write([]byte{0})
+	}
 }
 
 // freePlayerClient returns the ID of a placeholder paired client no running
