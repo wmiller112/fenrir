@@ -57,6 +57,46 @@ type CreateLobbyResponse struct {
 	LobbyID  string `json:"lobby_id"`
 }
 
+type PairedClient struct {
+	ClientID       string `json:"client_id"`
+	AppStateFolder string `json:"app_state_folder"`
+}
+
+type PairedClientsResponse struct {
+	Response `json:",inline"`
+	Clients  []PairedClient `json:"clients"`
+}
+
+// GET /api/v1/clients
+func (c *client) ListPairedClients(ctx context.Context) ([]PairedClient, error) {
+	u, err := url.JoinPath(c.apiURL, "/api/v1/clients")
+	if err != nil {
+		return nil, fmt.Errorf("invalid wolf API URL: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list paired clients: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var clientsResp PairedClientsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&clientsResp); err != nil {
+		return nil, fmt.Errorf("failed to decode paired clients: %w", err)
+	}
+
+	if !clientsResp.Success {
+		return nil, fmt.Errorf("failed to list paired clients: %s", clientsResp.Error)
+	}
+
+	return clientsResp.Clients, nil
+}
+
 // GET /api/v1/lobbies
 func (c *client) ListLobbies(ctx context.Context) ([]Lobby, error) {
 	u, err := url.JoinPath(c.apiURL, "/api/v1/lobbies")

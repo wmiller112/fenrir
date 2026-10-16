@@ -148,3 +148,18 @@ func TestJoinLobbyNumericSessionIDFallback(t *testing.T) {
 		t.Errorf("sent session IDs %v, want the string then the number", sent)
 	}
 }
+
+func TestListPairedClients(t *testing.T) {
+	client, _ := wolfServer(t, map[string]string{
+		"/api/v1/clients": `{"success":true,"clients":[{"client_id":"101","app_state_folder":"direwolf-player-1",
+			"settings":{"run_uid":1000,"run_gid":1000}}]}`,
+	})
+
+	clients, err := client.ListPairedClients(context.Background())
+	if err != nil {
+		t.Fatalf("ListPairedClients: %v", err)
+	}
+	if len(clients) != 1 || clients[0].ClientID != "101" || clients[0].AppStateFolder != "direwolf-player-1" {
+		t.Errorf("unexpected clients %+v", clients)
+	}
+}

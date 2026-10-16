@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -328,5 +329,60 @@ func TestPS2CoopExample(t *testing.T) {
 	}
 	if len(app.Spec.AppAssetWebP) == 0 || app.Spec.Template == nil {
 		t.Error("example is missing its icon or pod template")
+	}
+}
+
+func TestFreePlayerClient(t *testing.T) {
+	clients := []wolfapi.PairedClient{
+		{ClientID: "900", AppStateFolder: "someone-paired-for-real"},
+		{ClientID: "101", AppStateFolder: "direwolf-player-1"},
+		{ClientID: "102", AppStateFolder: "direwolf-player-2"},
+	}
+
+	got, err := freePlayerClient(clients, nil)
+	if err != nil || got != "101" {
+		t.Errorf("no sessions: got %q, %v, want the first slot", got, err)
+	}
+
+	// Each running session holds its client, the default one included
+	got, err = freePlayerClient(clients, []wolfapi.Session{{ClientID: "101"}, {ClientID: "6142509188972423790"}})
+	if err != nil || got != "102" {
+		t.Errorf("first slot used: got %q, %v, want the second", got, err)
+	}
+
+	if _, err := freePlayerClient(clients, []wolfapi.Session{{ClientID: "101"}, {ClientID: "102"}}); err == nil {
+		t.Error("all slots used, but got one")
+	}
+
+	// A Wolf started before slots existed falls back to the default client
+	got, err = freePlayerClient(clients[:1], nil)
+	if err != nil || got != "" {
+		t.Errorf("no slots: got %q, %v, want no client", got, err)
+	}
+}
+
+func TestWolfSeedConfig(t *testing.T) {
+	cfg := wolfSeedConfig("abc-123")
+
+	// Wolf only migrates configs older than v7, keeping these
+	for _, want := range []string{"config_version = 6\n", "hostname = \"Direwolf\"\n", "uuid = \"abc-123\"\n"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("seed config lacks %q:\n%s", want, cfg)
+		}
+	}
+	if got := strings.Count(cfg, "[[paired_clients]]"); got != playerClientSlots {
+		t.Errorf("seed config has %d paired clients, want %d", got, playerClientSlots)
+	}
+	for _, want := range []string{
+		"client_cert = \"direwolf-player-1\"\napp_state_folder = \"direwolf-player-1\"\n",
+		fmt.Sprintf("client_cert = \"direwolf-player-%d\"", playerClientSlots),
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("seed config lacks %q:\n%s", want, cfg)
+		}
+	}
+	// It's written with a quoted heredoc in the init container
+	if strings.Contains(cfg, "DIREWOLF_EOF") {
+		t.Error("seed config contains the heredoc delimiter")
 	}
 }

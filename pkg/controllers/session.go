@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	v1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
@@ -99,6 +100,8 @@ type SessionController struct {
 
 	// Serializes creating and joining Wolf lobbies for co-op apps
 	lobbyMu sync.Mutex
+	// Serializes picking a Wolf client and adding a session with it
+	addSessionMu sync.Mutex
 
 	controller           generic.Controller[*v1alpha1types.Session]
 	deploymentController generic.Controller[*appsv1.Deployment]
@@ -928,6 +931,10 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 				chmod 1777 -R /tmp/.X11-unix
 				mkdir -p /etc/wolf/cfg
 				# cp -LR /cfg/* /etc/wolf/cfg
+				if [ ! -f /etc/wolf/cfg/config.toml ]; then
+					cat > /etc/wolf/cfg/config.toml <<'DIREWOLF_EOF'
+`+wolfSeedConfig(string(uuid.NewUUID()))+`DIREWOLF_EOF
+				fi
 				chown -R ubuntu:ubuntu /etc/wolf
 				chmod 777 -R /etc/wolf
 			`,
@@ -1884,7 +1891,30 @@ func (c *SessionController) reconcileActiveStreams(
 			clientIP = session.Spec.Config.ClientIP
 		}
 
+		// Sessions reconcile on several workers: hold the lock so two
+		// players starting at once don't take the same client
+		c.addSessionMu.Lock()
+		defer c.addSessionMu.Unlock()
+
+		pairedClients, err := wolfclient.ListPairedClients(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list paired clients: %w", err)
+		}
+		// Sessions may have been added since the list above
+		sessions, err := wolfclient.ListSessions(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list sessions: %w", err)
+		}
+		clientID, err := freePlayerClient(pairedClients, sessions)
+		if err != nil {
+			return err
+		}
+		if clientID == "" {
+			klog.Warningf("Wolf of %s has no player slots, session %s/%s gets the shared default ID", deploymentName, session.Namespace, session.Name)
+		}
+
 		sessionID, err := wolfclient.AddSession(ctx, wolfapi.Session{
+			ClientID:          clientID,
 			VideoWidth:        session.Spec.Config.VideoWidth,
 			VideoHeight:       session.Spec.Config.VideoHeight,
 			VideoRefreshRate:  session.Spec.Config.VideoRefreshRate,
@@ -1931,6 +1961,54 @@ func (c *SessionController) reconcileActiveStreams(
 		}
 	}
 	return nil
+}
+
+const (
+	// Each pod's Wolf starts with this many placeholder paired clients, one
+	// per concurrent session. Wolf names a session after its client, so
+	// sessions added without one all get the same ID and break each other
+	// once a co-op pod streams to several players.
+	playerClientSlots = 8
+	// app_state_folder, and certificate, of the placeholder clients. Wolf
+	// only hashes the certificate, so it needn't be a real one.
+	playerClientPrefix = "direwolf-player-"
+)
+
+// wolfSeedConfig is the config.toml a pod's Wolf starts from. Wolf rebuilds
+// configs older than v7 from its defaults, keeping only the hostname, uuid
+// and paired clients, which is all this sets.
+func wolfSeedConfig(serverUUID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "config_version = 6\nhostname = \"Direwolf\"\nuuid = %q\n", serverUUID)
+	for i := 1; i <= playerClientSlots; i++ {
+		name := fmt.Sprintf("%s%d", playerClientPrefix, i)
+		fmt.Fprintf(&b, "\n[[paired_clients]]\nclient_cert = %q\napp_state_folder = %q\n", name, name)
+	}
+	return b.String()
+}
+
+// freePlayerClient returns the ID of a placeholder paired client no running
+// session uses, or "" if the pod's Wolf has none (it predates them).
+func freePlayerClient(clients []wolfapi.PairedClient, sessions []wolfapi.Session) (string, error) {
+	used := sets.New[string]()
+	for _, s := range sessions {
+		used.Insert(s.ClientID)
+	}
+
+	var slots int
+	for _, client := range clients {
+		if !strings.HasPrefix(client.AppStateFolder, playerClientPrefix) {
+			continue
+		}
+		slots++
+		if !used.Has(client.ClientID) {
+			return client.ClientID, nil
+		}
+	}
+	if slots == 0 {
+		return "", nil
+	}
+	return "", fmt.Errorf("all %d player slots of the pod are in use", slots)
 }
 
 const (
