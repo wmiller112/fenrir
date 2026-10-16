@@ -1926,8 +1926,8 @@ func (c *SessionController) reconcileActiveStreams(
 	session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", service.Spec.ClusterIP, session.Status.Ports.RTSP)
 
 	if coop := app.Spec.Coop; coop != nil {
-		if err := c.reconcileLobby(ctx, wolfclient, session, app, coop, wolfRenderNode(deployment)); err != nil {
-			return fmt.Errorf("failed to join co-op lobby: %w", err)
+		if err := c.ensureLobby(ctx, wolfclient, session, app, coop, wolfRenderNode(deployment)); err != nil {
+			return fmt.Errorf("failed to start co-op lobby: %w", err)
 		}
 	}
 	return nil
@@ -1969,14 +1969,18 @@ func wolfRenderNode(deployment *appsv1.Deployment) string {
 	return renderNode
 }
 
+// Prefix of the co-op lobbies the operator creates, which wolf-agent joins
+// streams to
+const coopLobbyPrefix = "direwolf-"
+
 func coopLobbyName(app *v1alpha1types.App) string {
-	return "direwolf-" + app.Name
+	return coopLobbyPrefix + app.Name
 }
 
-// reconcileLobby puts the session's Wolf session in the co-op lobby of its
-// pod, creating the lobby if it isn't running (first player, or everyone left
-// and Wolf stopped it).
-func (c *SessionController) reconcileLobby(
+// ensureLobby starts the co-op lobby of the session's pod if it isn't running
+// yet, before Moonlight gets the stream URL. wolf-agent joins each session to
+// it once its stream is up: Wolf only switches streams that already run.
+func (c *SessionController) ensureLobby(
 	ctx context.Context,
 	wolfclient wolfapi.Client,
 	session *v1alpha1types.Session,
@@ -1984,10 +1988,6 @@ func (c *SessionController) reconcileLobby(
 	coop *v1alpha1types.CoopConfig,
 	renderNode string,
 ) error {
-	if session.Status.WolfSessionID == "" {
-		return fmt.Errorf("session has no wolf session yet")
-	}
-
 	// Sessions reconcile on several workers, two players starting at once
 	// must not each create a lobby
 	c.lobbyMu.Lock()
@@ -1999,54 +1999,44 @@ func (c *SessionController) reconcileLobby(
 	}
 
 	name := coopLobbyName(app)
-	var lobbyID string
 	for _, lobby := range lobbies {
-		if lobby.Name != name {
-			continue
-		}
-		if slices.Contains(lobby.ConnectedSessions, session.Status.WolfSessionID) {
+		if lobby.Name == name {
 			return nil
 		}
-		lobbyID = lobby.ID
-		break
 	}
 
-	if lobbyID == "" {
-		caps := coop.VideoProducerBufferCaps
-		if caps == "" {
-			caps = "video/x-raw"
-		}
-
-		klog.Infof("Creating co-op lobby %s for session %s/%s", name, session.Namespace, session.Name)
-		lobbyID, err = wolfclient.CreateLobby(ctx, wolfapi.CreateLobbyRequest{
-			ProfileID:              "direwolf",
-			Name:                   name,
-			MultiUser:              true,
-			StopWhenEveryoneLeaves: true,
-			// Wolf scales the lobby's frames to each client's resolution
-			VideoSettings: wolfapi.LobbyVideoSettings{
-				Width:                   session.Spec.Config.VideoWidth,
-				Height:                  session.Spec.Config.VideoHeight,
-				RefreshRate:             session.Spec.Config.VideoRefreshRate,
-				WaylandRenderNode:       renderNode,
-				RunnerRenderNode:        renderNode,
-				VideoProducerBufferCaps: caps,
-			},
-			AudioSettings:     wolfapi.LobbyAudioSettings{ChannelCount: 2},
-			RunnerStateFolder: app.Name,
-			Runner: wolfapi.Runner{
-				Type:   "process",
-				RunCmd: coopLobbyRunCmd,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create lobby %s: %w", name, err)
-		}
+	caps := coop.VideoProducerBufferCaps
+	if caps == "" {
+		caps = "video/x-raw"
 	}
 
-	klog.Infof("Joining session %s/%s (wolf %s) to co-op lobby %s", session.Namespace, session.Name, session.Status.WolfSessionID, lobbyID)
-	if err := wolfclient.JoinLobby(ctx, lobbyID, session.Status.WolfSessionID); err != nil {
-		return fmt.Errorf("failed to join lobby %s: %w", lobbyID, err)
+	klog.Infof("Creating co-op lobby %s for session %s/%s", name, session.Namespace, session.Name)
+	_, err = wolfclient.CreateLobby(ctx, wolfapi.CreateLobbyRequest{
+		ProfileID: "direwolf",
+		Name:      name,
+		MultiUser: true,
+		// The lobby lives as long as the pod, which goes away once its
+		// last session does. Restarting it would give the app a new
+		// display, losing the game in progress.
+		StopWhenEveryoneLeaves: false,
+		// Wolf scales the lobby's frames to each client's resolution
+		VideoSettings: wolfapi.LobbyVideoSettings{
+			Width:                   session.Spec.Config.VideoWidth,
+			Height:                  session.Spec.Config.VideoHeight,
+			RefreshRate:             session.Spec.Config.VideoRefreshRate,
+			WaylandRenderNode:       renderNode,
+			RunnerRenderNode:        renderNode,
+			VideoProducerBufferCaps: caps,
+		},
+		AudioSettings:     wolfapi.LobbyAudioSettings{ChannelCount: 2},
+		RunnerStateFolder: app.Name,
+		Runner: wolfapi.Runner{
+			Type:   "process",
+			RunCmd: coopLobbyRunCmd,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create lobby %s: %w", name, err)
 	}
 	return nil
 }

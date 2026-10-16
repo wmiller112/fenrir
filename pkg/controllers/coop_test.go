@@ -146,7 +146,7 @@ func (f *fakeWolf) SubscribeToEvents(context.Context) (<-chan *sse.Event, error)
 	return nil, nil
 }
 
-func TestReconcileLobby(t *testing.T) {
+func TestEnsureLobby(t *testing.T) {
 	ctx := context.Background()
 	app := testApp("ps2", &v1alpha1types.CoopConfig{})
 	c := newCoopTestController(t)
@@ -156,15 +156,16 @@ func TestReconcileLobby(t *testing.T) {
 	alex.Spec.Config = v1alpha1types.SessionInfo{VideoWidth: 1280, VideoHeight: 720, VideoRefreshRate: 60}
 	alex.Status.WolfSessionID = "111"
 
-	// The first player creates the lobby and joins it
-	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
-		t.Fatalf("reconcileLobby(alex): %v", err)
+	// The first player starts the lobby, without joining it: Wolf would
+	// drop the switch since the stream isn't running yet
+	if err := c.ensureLobby(ctx, wolf, alex, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
+		t.Fatalf("ensureLobby(alex): %v", err)
 	}
 	if len(wolf.created) != 1 {
 		t.Fatalf("created %d lobbies, want 1", len(wolf.created))
 	}
 	created := wolf.created[0]
-	if created.Name != "direwolf-ps2" || !created.MultiUser || !created.StopWhenEveryoneLeaves {
+	if created.Name != "direwolf-ps2" || !created.MultiUser || created.StopWhenEveryoneLeaves {
 		t.Errorf("unexpected lobby %+v", created)
 	}
 	if v := created.VideoSettings; v.Width != 1280 || v.Height != 720 || v.RefreshRate != 60 ||
@@ -174,42 +175,74 @@ func TestReconcileLobby(t *testing.T) {
 	if created.Runner.Type != "process" || !strings.Contains(created.Runner.RunCmd, coopWaylandDisplay) {
 		t.Errorf("unexpected lobby runner %+v", created.Runner)
 	}
+	if len(wolf.joined) != 0 {
+		t.Errorf("operator joined %v, wolf-agent does that once streams run", wolf.joined)
+	}
 
-	// The second player joins the running lobby
+	// The second player finds it running
 	player2 := testSession("player2-1", "player2", "ps2", v1alpha1types.SessionPorts{})
 	player2.Status.WolfSessionID = "222"
-	if err := c.reconcileLobby(ctx, wolf, player2, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
-		t.Fatalf("reconcileLobby(player2): %v", err)
+	if err := c.ensureLobby(ctx, wolf, player2, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
+		t.Fatalf("ensureLobby(player2): %v", err)
 	}
-	// Reconciling again doesn't rejoin
-	if err := c.reconcileLobby(ctx, wolf, alex, app, app.Spec.Coop, "/dev/dri/renderD128"); err != nil {
-		t.Fatalf("reconcileLobby(alex) again: %v", err)
-	}
-
 	if len(wolf.created) != 1 {
 		t.Errorf("created %d lobbies, want 1", len(wolf.created))
 	}
-	want := []string{"lobby-direwolf-ps2/111", "lobby-direwolf-ps2/222"}
-	if strings.Join(wolf.joined, ",") != strings.Join(want, ",") {
-		t.Errorf("joined %v, want %v", wolf.joined, want)
+}
+
+func TestAgentJoinsCoopLobby(t *testing.T) {
+	ctx := context.Background()
+	wolf := &fakeWolf{lobbies: []wolfapi.Lobby{
+		{ID: "ui", Name: "Wolf UI lobby"},
+		{ID: "coop", Name: "direwolf-ps2", ConnectedSessions: []string{"111"}},
+	}}
+	agent := NewAgent(wolf)
+
+	// A new stream joins the co-op lobby, not other lobbies
+	joined, err := agent.tryJoinCoopLobby(ctx, "222")
+	if err != nil || joined != "coop" {
+		t.Fatalf("tryJoinCoopLobby(222) = %q, %v, want the co-op lobby", joined, err)
+	}
+	// One already in it isn't joined again
+	if joined, err := agent.tryJoinCoopLobby(ctx, "111"); err != nil || joined != "" {
+		t.Errorf("tryJoinCoopLobby(111) = %q, %v, want no join", joined, err)
+	}
+	if strings.Join(wolf.joined, ",") != "coop/222" {
+		t.Errorf("joined %v, want only coop/222", wolf.joined)
 	}
 
-	// Without a Wolf session there is nothing to join yet
-	pending := testSession("player3-1", "player3", "ps2", v1alpha1types.SessionPorts{})
-	if err := c.reconcileLobby(ctx, wolf, pending, app, app.Spec.Coop, "/dev/dri/renderD128"); err == nil {
-		t.Error("reconcileLobby without a wolf session succeeded")
+	// Pods of other apps have no co-op lobby
+	if joined, err := NewAgent(&fakeWolf{}).tryJoinCoopLobby(ctx, "333"); err != nil || joined != "" {
+		t.Errorf("without a co-op lobby got %q, %v", joined, err)
 	}
 }
 
-func TestReconcileLobbyCustomCaps(t *testing.T) {
+func TestAgentJoinCoopLobbyWaitsForStream(t *testing.T) {
+	old := coopJoinDelay
+	coopJoinDelay = 10 * time.Millisecond
+	t.Cleanup(func() { coopJoinDelay = old })
+
+	wolf := &fakeWolf{lobbies: []wolfapi.Lobby{{ID: "coop", Name: "direwolf-ps2"}}}
+	start := time.Now()
+	NewAgent(wolf).joinCoopLobby(context.Background(), "111")
+
+	if time.Since(start) < coopJoinDelay {
+		t.Error("joined before the stream had time to start")
+	}
+	if strings.Join(wolf.joined, ",") != "coop/111" {
+		t.Errorf("joined %v, want coop/111", wolf.joined)
+	}
+}
+
+func TestEnsureLobbyCustomCaps(t *testing.T) {
 	app := testApp("ps2", &v1alpha1types.CoopConfig{VideoProducerBufferCaps: "video/x-raw(memory:CUDAMemory)"})
 	c := newCoopTestController(t)
 	wolf := &fakeWolf{}
 
 	s := testSession("alex-1", "alex", "ps2", v1alpha1types.SessionPorts{})
 	s.Status.WolfSessionID = "1"
-	if err := c.reconcileLobby(context.Background(), wolf, s, app, app.Spec.Coop, "/dev/dri/renderD129"); err != nil {
-		t.Fatalf("reconcileLobby: %v", err)
+	if err := c.ensureLobby(context.Background(), wolf, s, app, app.Spec.Coop, "/dev/dri/renderD129"); err != nil {
+		t.Fatalf("ensureLobby: %v", err)
 	}
 
 	v := wolf.created[0].VideoSettings

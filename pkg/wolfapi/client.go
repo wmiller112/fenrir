@@ -307,7 +307,14 @@ type AppsResponse struct {
 type WolfEventType string
 const (
 	PauseStreamEventType WolfEventType = "wolf::core::events::PauseStreamEvent"
+	// Fired when a client's video stream is set up. Its pipeline starts once
+	// the client's first RTP ping arrives.
+	VideoSessionEventType WolfEventType = "wolf::core::events::VideoSession"
 )
+
+type VideoSessionEvent struct {
+	SessionID string `json:"session_id"`
+}
 
 type PauseStreamEvent struct {
 	SessionID string `json:"session_id"`

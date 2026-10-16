@@ -99,11 +99,12 @@ streams the same running instance, for games without netplay like PS2
   whoever launched them. The pod is owned by every session, so it outlives the
   first player leaving, and it uses the resources, volumes and sidecar
   policies of the user who started it.
-- The operator creates a Wolf lobby named `direwolf-<app>` and joins each
-  session's Wolf session to it, on the render node the pod's Wolf uses
-  (`WOLF_RENDER_NODE`). Wolf then streams the lobby's display to every
-  client and routes all their inputs to it, and stops the lobby once everyone
-  has left.
+- The operator starts a Wolf lobby named `direwolf-<app>` in the pod, on the
+  render node its Wolf uses (`WOLF_RENDER_NODE`), before handing Moonlight the
+  stream. wolf-agent joins each session to it once that session's stream is
+  running, since Wolf only switches streams that already run. Wolf then
+  streams the lobby's display to every client and routes all their inputs to
+  it. The lobby lives as long as the pod.
 - The game runs as the pod's own container, not as Wolf's runner, so the
   lobby's runner only links the lobby's Wayland socket to `direwolf-lobby` and
   writes its audio sink name to `direwolf-lobby-sink`, both in
