@@ -923,6 +923,12 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 				"sh", "-c", `
 				mkdir -p /mnt/data/wolf/cfg
 				cp /certs/* /mnt/data/wolf/cfg/
+				# Wolf's entrypoint puts its config under HOST_APPS_STATE_FOLDER.
+				# On a persistent volume, a config from an earlier pod is kept.
+				if [ ! -f /mnt/data/wolf/cfg/config.toml ]; then
+					cat > /mnt/data/wolf/cfg/config.toml <<'DIREWOLF_EOF'
+`+wolfSeedConfig(string(uuid.NewUUID()))+`DIREWOLF_EOF
+				fi
 				chown 1000:1000 /mnt/data/wolf
 				chmod 777 /mnt/data/wolf
 				chown -R 1000:1000 /mnt/data/wolf/cfg
@@ -931,10 +937,6 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 				chmod 1777 -R /tmp/.X11-unix
 				mkdir -p /etc/wolf/cfg
 				# cp -LR /cfg/* /etc/wolf/cfg
-				if [ ! -f /etc/wolf/cfg/config.toml ]; then
-					cat > /etc/wolf/cfg/config.toml <<'DIREWOLF_EOF'
-`+wolfSeedConfig(string(uuid.NewUUID()))+`DIREWOLF_EOF
-				fi
 				chown -R ubuntu:ubuntu /etc/wolf
 				chmod 777 -R /etc/wolf
 			`,
