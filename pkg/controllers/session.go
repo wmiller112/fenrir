@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	"games-on-whales.github.io/direwolf/pkg/api/v1alpha1"
@@ -84,6 +85,12 @@ type SessionController struct {
 	trackedSessions map[userGame]sets.Set[string]
 	trackedGames    map[string]userGame
 
+	// Port slot reserved by each user's game, so concurrent streams on the
+	// shared LoadBalancer IP don't collide. Guarded by portsMu since the
+	// session controller runs several workers.
+	portsMu   sync.Mutex
+	portSlots map[userGame]int32
+
 	controller           generic.Controller[*v1alpha1types.Session]
 	deploymentController generic.Controller[*appsv1.Deployment]
 	SessionControllerOptions
@@ -111,6 +118,7 @@ func NewSessionController(
 		UserInformer:             userInformer,
 		trackedSessions:          make(map[userGame]sets.Set[string]),
 		trackedGames:             make(map[string]userGame),
+		portSlots:                make(map[userGame]int32),
 		SessionControllerOptions: options,
 	}
 
@@ -231,6 +239,7 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 				existing.Delete(name)
 				if existing.Len() == 0 {
 					delete(c.trackedSessions, gam)
+					c.releasePorts(gam)
 				}
 			}
 
@@ -256,6 +265,7 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 	} else {
 		c.trackedSessions[ug] = sets.New(newObj.Name)
 	}
+	c.trackedGames[newObj.Name] = ug
 
 	oldStatus := newObj.Status.DeepCopy()
 	portsError := c.allocatePorts(context.TODO(), newObj)
@@ -519,10 +529,15 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 
 	session.Status.ServiceName = fmt.Sprintf("%s-rtp", clampString(session.Name, 56))
 
-	// HACK: Delete all direwolf-worker services that dont match the service name
-	// This is until we can control the ports in wolf
+	// Delete older services for this user's game: they point at the same pod
+	// with the same ports. Other users' streams have their own ports and are
+	// left alone.
 	allServices, err := c.K8sClient.CoreV1().Services(session.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app=direwolf-worker",
+		LabelSelector: labels.SelectorFromSet(labels.Set{
+			"app":           "direwolf-worker",
+			"direwolf/app":  session.Spec.GameReference.Name,
+			"direwolf/user": session.Spec.UserReference.Name,
+		}).String(),
 	})
 
 	if err != nil {
@@ -794,6 +809,14 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	if session.Spec.Config.ClientIP != "" {
 		wolfEnvVars["WOLF_STREAM_CLIENT_IP"] = session.Spec.Config.ClientIP
 	}
+
+	// Listen on this session's ports so concurrent streams can share the
+	// LoadBalancer IP. Wolf sends the stream ports to Moonlight in its RTSP
+	// replies, and Moonlight takes the RTSP port from the launch response.
+	wolfEnvVars["WOLF_RTSP_SETUP_PORT"] = fmt.Sprint(session.Status.Ports.RTSP)
+	wolfEnvVars["WOLF_CONTROL_PORT"] = fmt.Sprint(session.Status.Ports.Control)
+	wolfEnvVars["WOLF_VIDEO_PING_PORT"] = fmt.Sprint(session.Status.Ports.VideoRTP)
+	wolfEnvVars["WOLF_AUDIO_PING_PORT"] = fmt.Sprint(session.Status.Ports.AudioRTP)
 	var podToCreate corev1.PodTemplateSpec
 	if app.Spec.Template != nil {
 		podToCreate.ObjectMeta = app.Spec.Template.ObjectMeta
@@ -1508,24 +1531,103 @@ func (c *SessionController) allocatePorts(
 	ctx context.Context,
 	session *v1alpha1types.Session,
 ) error {
-	//!TODO: Take lock if multiple workers are running
+	c.portsMu.Lock()
+	defer c.portsMu.Unlock()
 
-	// 0. Allocate ports for this streaming session to use
-	// 1. List all listeners for the gateway
-	// 2. List all routes attached to the gateway
-	// 3. Subtract used ports
-	// 4. Choose a port for RTSP, Enet, Video RTP, Audio RTP
-
-	//!TODO: Implement this properly once wolf lets us assign ports. For now, just
-	// hardcode some ports.
-	session.Status.Ports = v1alpha1types.SessionPorts{
-		RTSP:     48010,
-		Control:  47999,
-		VideoRTP: 48100,
-		AudioRTP: 48200,
+	ug := userGame{
+		Game: session.Spec.GameReference.Name,
+		User: session.Spec.UserReference.Name,
 	}
 
+	// Every session of a user's game shares one pod, so they share its ports.
+	// Keep ports already assigned, then a slot already reserved for this game,
+	// then one held by another of its sessions (e.g. after an operator restart).
+	if session.Status.Ports.RTSP != 0 {
+		if slot, ok := portSlotOf(session.Status.Ports); ok {
+			c.portSlots[ug] = slot
+		}
+		return nil
+	}
+
+	slot, ok := c.portSlots[ug]
+	if !ok {
+		sessions, err := c.SessionInformer.Namespaced(session.Namespace).List(labels.Everything())
+		if err != nil {
+			return fmt.Errorf("failed to list sessions: %w", err)
+		}
+
+		used := sets.New[int32]()
+		for other, s := range c.portSlots {
+			if other != ug {
+				used.Insert(s)
+			}
+		}
+		for _, other := range sessions {
+			otherSlot, hasSlot := portSlotOf(other.Status.Ports)
+			if !hasSlot {
+				continue
+			}
+			if other.Spec.UserReference.Name == ug.User && other.Spec.GameReference.Name == ug.Game {
+				slot, ok = otherSlot, true
+				break
+			}
+			used.Insert(otherSlot)
+		}
+
+		for candidate := int32(0); !ok && candidate < maxPortSlots; candidate++ {
+			if !used.Has(candidate) {
+				slot, ok = candidate, true
+			}
+		}
+		if !ok {
+			return fmt.Errorf("all %d stream port slots are in use", maxPortSlots)
+		}
+		c.portSlots[ug] = slot
+	}
+
+	session.Status.Ports = portsForSlot(slot)
 	return nil
+}
+
+// releasePorts frees the port slot of a user's game once it has no sessions
+func (c *SessionController) releasePorts(ug userGame) {
+	c.portsMu.Lock()
+	defer c.portsMu.Unlock()
+	delete(c.portSlots, ug)
+}
+
+const (
+	// Concurrent streams each get their own block of ports, this far apart,
+	// on the LoadBalancer IP the sessions share
+	portSlotStride = 1000
+	maxPortSlots   = 16
+)
+
+// Slot 0 is Wolf's default ports
+var basePorts = v1alpha1types.SessionPorts{
+	RTSP:     48010,
+	Control:  47999,
+	VideoRTP: 48100,
+	AudioRTP: 48200,
+}
+
+func portsForSlot(slot int32) v1alpha1types.SessionPorts {
+	offset := slot * portSlotStride
+	return v1alpha1types.SessionPorts{
+		RTSP:     basePorts.RTSP + offset,
+		Control:  basePorts.Control + offset,
+		VideoRTP: basePorts.VideoRTP + offset,
+		AudioRTP: basePorts.AudioRTP + offset,
+	}
+}
+
+// portSlotOf returns the slot ports were allocated from, if they were
+func portSlotOf(ports v1alpha1types.SessionPorts) (int32, bool) {
+	if ports.RTSP < basePorts.RTSP || (ports.RTSP-basePorts.RTSP)%portSlotStride != 0 {
+		return 0, false
+	}
+	slot := (ports.RTSP - basePorts.RTSP) / portSlotStride
+	return slot, ports == portsForSlot(slot)
 }
 
 // reconcileActiveStreams calls out to wolf-agent on the running pod to ensure
