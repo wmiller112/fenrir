@@ -892,6 +892,13 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			{Name: "GAMESCOPE_WIDTH", Value: fmt.Sprint(session.Spec.Config.VideoWidth)},
 			{Name: "GAMESCOPE_HEIGHT", Value: fmt.Sprint(session.Spec.Config.VideoHeight)},
 			{Name: "GAMESCOPE_REFRESH", Value: fmt.Sprint(session.Spec.Config.VideoRefreshRate)},
+
+			// Who launched the app. Co-op pods are shared, so their user
+			// label is empty, and this is the user who started the pod.
+			// Comes after the app's own env so it wins over an older
+			// fieldRef to that label.
+			{Name: "DIREWOLF_USER", Value: session.Spec.UserReference.Name},
+			{Name: "DIREWOLF_APP", Value: session.Spec.GameReference.Name},
 		}...)
 
 		// Validate the main app container's resources against the user's policy.
