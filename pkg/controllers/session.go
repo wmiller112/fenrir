@@ -5,9 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,6 +94,9 @@ type SessionController struct {
 	portsMu   sync.Mutex
 	portSlots map[userGame]int32
 
+	// Serializes creating and joining Wolf lobbies for co-op apps
+	lobbyMu sync.Mutex
+
 	controller           generic.Controller[*v1alpha1types.Session]
 	deploymentController generic.Controller[*appsv1.Deployment]
 	SessionControllerOptions
@@ -156,8 +162,9 @@ func (c *SessionController) Run(ctx context.Context) error {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if !cache.WaitForCacheSync(sessionCtx.Done(), c.SessionInformer.HasSynced) {
-		return fmt.Errorf("failed to sync session informer")
+	// Apps are needed too, to know which sessions share a co-op pod
+	if !cache.WaitForCacheSync(sessionCtx.Done(), c.SessionInformer.HasSynced, c.AppInformer.HasSynced) {
+		return fmt.Errorf("failed to sync session and app informers")
 	}
 
 	// Build initial listing of sessions
@@ -167,10 +174,7 @@ func (c *SessionController) Run(ctx context.Context) error {
 	}
 
 	for _, session := range sessions {
-		ug := userGame{
-			Game: session.Spec.GameReference.Name,
-			User: session.Spec.UserReference.Name,
-		}
+		ug := c.podKey(session)
 		if existing, ok := c.trackedSessions[ug]; ok {
 			existing.Insert(session.Name)
 		} else {
@@ -255,10 +259,7 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 		}
 		return nil
 	}
-	ug := userGame{
-		Game: newObj.Spec.GameReference.Name,
-		User: newObj.Spec.UserReference.Name,
-	}
+	ug := c.podKey(newObj)
 
 	if existing, ok := c.trackedSessions[ug]; ok {
 		existing.Insert(newObj.Name)
@@ -527,17 +528,32 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 		return s
 	}
 
-	session.Status.ServiceName = fmt.Sprintf("%s-rtp", clampString(session.Name, 56))
+	// Each session gets its own service, replacing older ones of its pod. Co-op
+	// sessions stream at the same time, so they share one service instead,
+	// owned by all of them.
+	serviceName := session.Name
+	owners := []*metav1ac.OwnerReferenceApplyConfiguration{
+		metav1ac.OwnerReference().
+			WithName(session.Name).
+			WithAPIVersion(v1alpha1.GroupVersion.String()).
+			WithKind("Session").
+			WithUID(session.UID).
+			WithController(true),
+	}
+	if c.coopConfig(session) != nil {
+		serviceName = c.deploymentName(session)
+		owners = ownerApplyConfigs(c.sessionOwners(session))
+	}
+	session.Status.ServiceName = fmt.Sprintf("%s-rtp", clampString(serviceName, 56))
 
-	// Delete older services for this user's game: they point at the same pod
-	// with the same ports. Other users' streams have their own ports and are
-	// left alone.
+	podLabels := c.podLabels(session)
+	serviceLabels := map[string]string{"app": "direwolf-worker"}
+	maps.Copy(serviceLabels, podLabels)
+
+	// Delete older services for this pod: they point at the same pod with the
+	// same ports. Other pods' streams have their own ports and are left alone.
 	allServices, err := c.K8sClient.CoreV1().Services(session.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{
-			"app":           "direwolf-worker",
-			"direwolf/app":  session.Spec.GameReference.Name,
-			"direwolf/user": session.Spec.UserReference.Name,
-		}).String(),
+		LabelSelector: labels.SelectorFromSet(serviceLabels).String(),
 	})
 
 	if err != nil {
@@ -567,27 +583,12 @@ func (c *SessionController) reconcileService(ctx context.Context, session *v1alp
 					"lbipam.cilium.io/sharing-key":        c.LBSharingKey,
 					"metallb.universe.tf/allow-shared-ip": c.LBSharingKey,
 				}).
-				WithLabels(
-					map[string]string{
-						"app":           "direwolf-worker",
-						"direwolf/app":  session.Spec.GameReference.Name,
-						"direwolf/user": session.Spec.UserReference.Name,
-					},
-				).
-				WithOwnerReferences(metav1ac.OwnerReference().
-					WithName(session.Name).
-					WithAPIVersion(v1alpha1.GroupVersion.String()).
-					WithKind("Session").
-					WithUID(session.UID).
-					WithController(true)).
+				WithLabels(serviceLabels).
+				WithOwnerReferences(owners...).
 				WithSpec(
 					v1ac.ServiceSpec().
 						WithType(corev1.ServiceTypeLoadBalancer).
-						WithSelector(
-							map[string]string{
-								"direwolf/app":  session.Spec.GameReference.Name,
-								"direwolf/user": session.Spec.UserReference.Name,
-							}).
+						WithSelector(podLabels).
 						WithPorts(
 							v1ac.ServicePort().
 								WithName("wa"). // wolf-agent
@@ -713,51 +714,29 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 		return fmt.Errorf("failed to get user %s: %w", session.Spec.UserReference.Name, err)
 	}
 
-	ug := userGame{
-		Game: session.Spec.GameReference.Name,
-		User: session.Spec.UserReference.Name,
-	}
+	// Every session streaming from the pod owns it, so it outlives any one
+	// of them, like the first player leaving a co-op game
+	owners := c.sessionOwners(session)
 
-	var owners []metav1.OwnerReference
-	var ownerApply []*metav1ac.OwnerReferenceApplyConfiguration
-	if sessions, ok := c.trackedSessions[ug]; ok {
-		for name := range sessions {
-			sess, err := c.SessionInformer.Namespaced(session.Namespace).Get(name)
-			if err != nil {
-				klog.Errorf("Failed to get session %s/%s: %s", session.Namespace, name, err)
-				continue
-			}
-			owner := metav1.OwnerReference{
-				APIVersion: v1alpha1.GroupVersion.String(),
-				Kind:       "Session",
-				Name:       name,
-				UID:        sess.UID,
-				Controller: ptr.To(true),
-			}
-			owners = append(owners, owner)
-			ownerApply = append(ownerApply, metav1ac.OwnerReference().
-				WithName(name).
-				WithAPIVersion(v1alpha1.GroupVersion.String()).
-				WithKind("Session").
-				WithUID(session.UID).
-				WithController(true))
-		}
-	}
-
-	// If deployment already exists, just skip
+	// If deployment already exists, just update its owners
 	deploymentName := c.deploymentName(session)
 	if _, err := c.deploymentController.Informer().Namespaced(session.Namespace).Get(deploymentName); err == nil {
 		klog.Infof("Deployment %s/%s already exists, just updating metadata", session.Namespace, deploymentName)
-		c.K8sClient.AppsV1().Deployments(session.Namespace).Apply(
-			context.Background(),
+		_, err := c.K8sClient.AppsV1().Deployments(session.Namespace).Apply(
+			ctx,
 			appsv1ac.Deployment(deploymentName, session.Namespace).
-				WithOwnerReferences(ownerApply...),
+				WithOwnerReferences(ownerApplyConfigs(owners)...),
 			metav1.ApplyOptions{
 				FieldManager: "direwolf-session-controller-deployment-owners",
 			})
+		if err != nil {
+			return fmt.Errorf("failed to update owners of deployment %s: %w", deploymentName, err)
+		}
 
 		return nil
 	}
+
+	coop := c.coopConfig(session)
 
 	// Create pod from pod template
 	app, err := c.AppInformer.Namespaced(session.Namespace).Get(session.Spec.GameReference.Name)
@@ -807,7 +786,9 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 		}
 	}
 
-	if session.Spec.Config.ClientIP != "" {
+	// A co-op pod streams to several clients, which each pass their IP when
+	// their Wolf session is added
+	if session.Spec.Config.ClientIP != "" && coop == nil {
 		wolfEnvVars["WOLF_STREAM_CLIENT_IP"] = session.Spec.Config.ClientIP
 	}
 
@@ -829,8 +810,14 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 	}
 
 	podToCreate.Labels["app"] = "direwolf-worker"
-	podToCreate.Labels["direwolf/app"] = session.Spec.GameReference.Name
-	podToCreate.Labels["direwolf/user"] = session.Spec.UserReference.Name
+	maps.Copy(podToCreate.Labels, c.podLabels(session))
+
+	// The app draws into the session's own display, or for co-op the
+	// lobby's, which the lobby runner links to a fixed name
+	waylandDisplay := "wayland-1"
+	if coop != nil {
+		waylandDisplay = coopWaylandDisplay
+	}
 
 	// if podToCreate.Spec.SecurityContext == nil {
 	// 	podToCreate.Spec.SecurityContext = &corev1.PodSecurityContext{}
@@ -873,7 +860,7 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			{Name: "DISPLAY", Value: ":0"},
 			// Container must have extra logic to wait for this to be set up
 			// unfortunately.
-			{Name: "WAYLAND_DISPLAY", Value: "wayland-1"},
+			{Name: "WAYLAND_DISPLAY", Value: waylandDisplay},
 			{Name: "TZ", Value: wolfEnvVars["TZ"]},
 			{Name: "UNAME", Value: "retro"},
 			{Name: "XDG_RUNTIME_DIR", Value: "/tmp/.X11-unix"},			// "UID":             "1000",
@@ -1308,18 +1295,15 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			Namespace: session.Namespace,
 			Labels: map[string]string{
 				"app":           "direwolf-worker",
-				"direwolf/app":  session.Spec.GameReference.Name,
-				"direwolf/user": session.Spec.UserReference.Name,
+				"direwolf/app":  c.podKey(session).Game,
+				"direwolf/user": c.podKey(session).User,
 			},
 			OwnerReferences: owners,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To[int32](1),
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"direwolf/app":  session.Spec.GameReference.Name,
-					"direwolf/user": session.Spec.UserReference.Name,
-				},
+				MatchLabels: c.podLabels(session),
 			},
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RecreateDeploymentStrategyType,
@@ -1525,7 +1509,84 @@ func (c *SessionController) reconcilePVC(ctx context.Context, session *v1alpha1t
 	return nil
 }
 func (c *SessionController) deploymentName(session *v1alpha1types.Session) string {
-	return fmt.Sprintf("%s-%s", session.Spec.UserReference.Name, session.Spec.GameReference.Name)
+	key := c.podKey(session)
+	if key.User == "" {
+		return "coop-" + key.Game
+	}
+	return fmt.Sprintf("%s-%s", key.User, key.Game)
+}
+
+// coopConfig returns the co-op settings of the session's app, or nil if the
+// app isn't co-op.
+func (c *SessionController) coopConfig(session *v1alpha1types.Session) *v1alpha1types.CoopConfig {
+	if c.AppInformer == nil {
+		return nil
+	}
+	app, err := c.AppInformer.Namespaced(session.Namespace).Get(session.Spec.GameReference.Name)
+	if err != nil {
+		return nil
+	}
+	return app.Spec.Coop
+}
+
+// podKey identifies the pod a session streams from. Each user gets their own
+// pod for an app, except for co-op apps where everyone shares one, keyed with
+// an empty user.
+func (c *SessionController) podKey(session *v1alpha1types.Session) userGame {
+	key := userGame{
+		Game: session.Spec.GameReference.Name,
+		User: session.Spec.UserReference.Name,
+	}
+	if c.coopConfig(session) != nil {
+		key.User = ""
+	}
+	return key
+}
+
+// podLabels selects the pod a session streams from, and labels the objects
+// made for it. Co-op pods have an empty user label.
+func (c *SessionController) podLabels(session *v1alpha1types.Session) map[string]string {
+	key := c.podKey(session)
+	return map[string]string{
+		"direwolf/app":  key.Game,
+		"direwolf/user": key.User,
+	}
+}
+
+// sessionOwners lists the sessions streaming from the session's pod, as owner
+// references for the objects they share. None of them is the controller,
+// since an object may only have one.
+func (c *SessionController) sessionOwners(session *v1alpha1types.Session) []metav1.OwnerReference {
+	var owners []metav1.OwnerReference
+	for name := range c.trackedSessions[c.podKey(session)] {
+		sess, err := c.SessionInformer.Namespaced(session.Namespace).Get(name)
+		if err != nil {
+			klog.Errorf("Failed to get session %s/%s: %s", session.Namespace, name, err)
+			continue
+		}
+		owners = append(owners, metav1.OwnerReference{
+			APIVersion: v1alpha1.GroupVersion.String(),
+			Kind:       "Session",
+			Name:       name,
+			UID:        sess.UID,
+		})
+	}
+	slices.SortFunc(owners, func(a, b metav1.OwnerReference) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return owners
+}
+
+func ownerApplyConfigs(owners []metav1.OwnerReference) []*metav1ac.OwnerReferenceApplyConfiguration {
+	res := make([]*metav1ac.OwnerReferenceApplyConfiguration, 0, len(owners))
+	for _, owner := range owners {
+		res = append(res, metav1ac.OwnerReference().
+			WithName(owner.Name).
+			WithAPIVersion(owner.APIVersion).
+			WithKind(owner.Kind).
+			WithUID(owner.UID))
+	}
+	return res
 }
 
 func (c *SessionController) allocatePorts(
@@ -1535,14 +1596,12 @@ func (c *SessionController) allocatePorts(
 	c.portsMu.Lock()
 	defer c.portsMu.Unlock()
 
-	ug := userGame{
-		Game: session.Spec.GameReference.Name,
-		User: session.Spec.UserReference.Name,
-	}
+	ug := c.podKey(session)
 
-	// Every session of a user's game shares one pod, so they share its ports.
-	// Keep ports already assigned, then a slot already reserved for this game,
-	// then one held by another of its sessions (e.g. after an operator restart).
+	// Every session of a pod shares its ports: those of a user's game, or of
+	// a co-op game. Keep ports already assigned, then a slot already reserved
+	// for this pod, then one held by another of its sessions (e.g. after an
+	// operator restart).
 	if session.Status.Ports.RTSP != 0 {
 		if slot, ok := portSlotOf(session.Status.Ports); ok {
 			c.portSlots[ug] = slot
@@ -1568,7 +1627,7 @@ func (c *SessionController) allocatePorts(
 			if !hasSlot {
 				continue
 			}
-			if other.Spec.UserReference.Name == ug.User && other.Spec.GameReference.Name == ug.Game {
+			if c.podKey(other) == ug {
 				slot, ok = otherSlot, true
 				break
 			}
@@ -1590,7 +1649,7 @@ func (c *SessionController) allocatePorts(
 	return nil
 }
 
-// releasePorts frees the port slot of a user's game once it has no sessions
+// releasePorts frees the port slot of a pod once it has no sessions
 func (c *SessionController) releasePorts(ug userGame) {
 	c.portsMu.Lock()
 	defer c.portsMu.Unlock()
@@ -1840,5 +1899,113 @@ func (c *SessionController) reconcileActiveStreams(
 	}
 
 	session.Status.StreamURL = fmt.Sprintf("rtsp://%s:%d", service.Spec.ClusterIP, session.Status.Ports.RTSP)
+
+	if coop := app.Spec.Coop; coop != nil {
+		if err := c.reconcileLobby(ctx, wolfclient, session, app, coop); err != nil {
+			return fmt.Errorf("failed to join co-op lobby: %w", err)
+		}
+	}
+	return nil
+}
+
+const (
+	// Name the co-op lobby runner links the lobby's Wayland socket to, in
+	// the XDG_RUNTIME_DIR shared by the pod's containers
+	coopWaylandDisplay = "direwolf-lobby"
+	// File in XDG_RUNTIME_DIR the lobby runner writes the lobby's audio sink
+	// name to, for the app to use as PULSE_SINK
+	coopSinkFile = "direwolf-lobby-sink"
+)
+
+// Wolf runs this inside its container for as long as the lobby lives. The app
+// is the pod's own container, so this only points it at the lobby's display
+// and audio sink. Wolf splits the command line itself, without a shell.
+var coopLobbyRunCmd = fmt.Sprintf(
+	`sh -c "ln -sfn $WAYLAND_DISPLAY $XDG_RUNTIME_DIR/%s && echo $PULSE_SINK > $XDG_RUNTIME_DIR/%s && exec sleep infinity"`,
+	coopWaylandDisplay, coopSinkFile,
+)
+
+func coopLobbyName(app *v1alpha1types.App) string {
+	return "direwolf-" + app.Name
+}
+
+// reconcileLobby puts the session's Wolf session in the co-op lobby of its
+// pod, creating the lobby if it isn't running (first player, or everyone left
+// and Wolf stopped it).
+func (c *SessionController) reconcileLobby(
+	ctx context.Context,
+	wolfclient wolfapi.Client,
+	session *v1alpha1types.Session,
+	app *v1alpha1types.App,
+	coop *v1alpha1types.CoopConfig,
+) error {
+	if session.Status.WolfSessionID == "" {
+		return fmt.Errorf("session has no wolf session yet")
+	}
+
+	// Sessions reconcile on several workers, two players starting at once
+	// must not each create a lobby
+	c.lobbyMu.Lock()
+	defer c.lobbyMu.Unlock()
+
+	lobbies, err := wolfclient.ListLobbies(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list lobbies: %w", err)
+	}
+
+	name := coopLobbyName(app)
+	var lobbyID string
+	for _, lobby := range lobbies {
+		if lobby.Name != name {
+			continue
+		}
+		if slices.Contains(lobby.ConnectedSessions, session.Status.WolfSessionID) {
+			return nil
+		}
+		lobbyID = lobby.ID
+		break
+	}
+
+	if lobbyID == "" {
+		renderNode := "/dev/dri/renderD128"
+		if vars := app.Spec.WolfConfig.RuntimeVariables; vars != nil && vars.RenderNode != "" {
+			renderNode = vars.RenderNode
+		}
+		caps := coop.VideoProducerBufferCaps
+		if caps == "" {
+			caps = "video/x-raw"
+		}
+
+		klog.Infof("Creating co-op lobby %s for session %s/%s", name, session.Namespace, session.Name)
+		lobbyID, err = wolfclient.CreateLobby(ctx, wolfapi.CreateLobbyRequest{
+			ProfileID:              "direwolf",
+			Name:                   name,
+			MultiUser:              true,
+			StopWhenEveryoneLeaves: true,
+			// Wolf scales the lobby's frames to each client's resolution
+			VideoSettings: wolfapi.LobbyVideoSettings{
+				Width:                   session.Spec.Config.VideoWidth,
+				Height:                  session.Spec.Config.VideoHeight,
+				RefreshRate:             session.Spec.Config.VideoRefreshRate,
+				WaylandRenderNode:       renderNode,
+				RunnerRenderNode:        renderNode,
+				VideoProducerBufferCaps: caps,
+			},
+			AudioSettings:     wolfapi.LobbyAudioSettings{ChannelCount: 2},
+			RunnerStateFolder: app.Name,
+			Runner: wolfapi.Runner{
+				Type:   "process",
+				RunCmd: coopLobbyRunCmd,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create lobby %s: %w", name, err)
+		}
+	}
+
+	klog.Infof("Joining session %s/%s (wolf %s) to co-op lobby %s", session.Namespace, session.Name, session.Status.WolfSessionID, lobbyID)
+	if err := wolfclient.JoinLobby(ctx, lobbyID, session.Status.WolfSessionID); err != nil {
+		return fmt.Errorf("failed to join lobby %s: %w", lobbyID, err)
+	}
 	return nil
 }

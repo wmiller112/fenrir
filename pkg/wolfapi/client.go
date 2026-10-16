@@ -53,6 +53,9 @@ type Client interface {
 	StopSession(ctx context.Context, sessionID string) error
 	ListSessions(ctx context.Context) ([]Session, error)
 	ListApps(ctx context.Context) ([]App, error)
+	ListLobbies(ctx context.Context) ([]Lobby, error)
+	CreateLobby(ctx context.Context, lobby CreateLobbyRequest) (string, error)
+	JoinLobby(ctx context.Context, lobbyID, sessionID string) error
 	SubscribeToEvents(ctx context.Context) (<-chan *sse.Event, error)
 }
 

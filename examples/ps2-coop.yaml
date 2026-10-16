@@ -1,0 +1,111 @@
+---
+# yaml-language-server: $schema=https://github.com/games-on-whaless/fenrir/raw/refs/heads/main/schemas/direwolf.games-on-whales.github.io/app_v1alpha1.json
+#
+# PS2 co-op through ES-DE, which bundles PCSX2. Every user launching this app
+# joins the same running instance in a shared Wolf lobby. Whoever launches
+# first starts the pod, and everyone sees their screen. Each Moonlight client
+# brings its own gamepad: map them to PCSX2's controller ports 1 and 2.
+#
+# Put PS2 games in <ROMs>/ps2 and the PS2 BIOS in <bioses> on the node, and
+# change the hostPaths below to match.
+apiVersion: direwolf.games-on-whales.github.io/v1alpha1
+kind: App
+metadata:
+  name: ps2-coop
+  namespace: direwolf
+spec:
+  # 1x1 placeholder, replace with box art
+  appAssetWebP: UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==
+  id: 4
+  isHDRSupported: false
+  title: PS2 Co-op
+  coop:
+    # The default works with every GPU. On NVIDIA,
+    # "video/x-raw(memory:CUDAMemory)" saves a copy per frame.
+    videoProducerBufferCaps: video/x-raw
+  wolfConfig:
+    runtimeVariables:
+      renderNode: /dev/dri/renderD128
+  template:
+    spec:
+      hostIPC: true
+      containers:
+      - name: app
+        image: ghcr.io/games-on-whales/es-de:edge
+        securityContext:
+          capabilities:
+            add: ["SYS_ADMIN", "SYS_NICE", "SYS_PTRACE", "NET_RAW", "MKNOD", "NET_ADMIN"]
+          seccompProfile:
+            type: Unconfined
+          appArmorProfile:
+            type: Unconfined
+          allowPrivilegeEscalation: true
+          runAsUser: 0
+          runAsGroup: 0
+        env:
+        - name: RUN_SWAY
+          value: "true"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          cleanup() {
+            echo "Cleaning up..." >&2
+            exit 0
+          }
+          trap cleanup SIGINT SIGTERM
+
+          # WAYLAND_DISPLAY is the co-op lobby's display, which only appears
+          # once the first player's stream has started the lobby
+          while [ ! -S $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ]; do
+            echo "Waiting for co-op lobby display..." >&2
+            sleep 1
+          done
+
+          while [ ! -S $XDG_RUNTIME_DIR/pulse-socket ]; do
+            echo "Waiting for pulse socket..." >&2
+            sleep 1
+          done
+
+          # Play into the lobby's audio sink, which every player hears
+          export PULSE_SINK="$(cat $XDG_RUNTIME_DIR/direwolf-lobby-sink)"
+          export PULSE_SOURCE="${PULSE_SINK}.monitor"
+
+          chown -R $PUID:$PGID /home/retro
+          chmod -R 777 /home/retro
+          exec /entrypoint.sh
+        volumeMounts:
+        - name: uinput
+          mountPath: /dev/uinput
+        - name: input-events
+          mountPath: /dev/input
+        - name: roms
+          mountPath: /ROMs
+          readOnly: true
+        - name: bioses
+          mountPath: /bioses
+          readOnly: true
+      volumes:
+      - name: uinput
+        hostPath:
+          path: /dev/uinput
+          type: CharDevice
+      - name: input-events
+        hostPath:
+          path: /dev/input
+          type: Directory
+      - name: roms
+        hostPath:
+          path: /srv/games/ROMs
+          type: Directory
+      - name: bioses
+        hostPath:
+          path: /srv/games/bioses
+          type: Directory
+  # Keeps memory cards and settings between sessions
+  volumeClaimTemplate:
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi

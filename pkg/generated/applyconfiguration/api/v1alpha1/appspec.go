@@ -32,6 +32,7 @@ type AppSpecApplyConfiguration struct {
 	Template            *v1.PodTemplateSpec               `json:"template,omitempty"`
 	WolfConfig          *WolfConfigApplyConfiguration     `json:"wolfConfig,omitempty"`
 	VolumeClaimTemplate *v1.PersistentVolumeClaimTemplate `json:"volumeClaimTemplate,omitempty"`
+	Coop                *CoopConfigApplyConfiguration     `json:"coop,omitempty"`
 }
 
 // AppSpecApplyConfiguration constructs a declarative configuration of the AppSpec type for use with
@@ -95,5 +96,13 @@ func (b *AppSpecApplyConfiguration) WithWolfConfig(value *WolfConfigApplyConfigu
 // If called multiple times, the VolumeClaimTemplate field is set to the value of the last call.
 func (b *AppSpecApplyConfiguration) WithVolumeClaimTemplate(value v1.PersistentVolumeClaimTemplate) *AppSpecApplyConfiguration {
 	b.VolumeClaimTemplate = &value
+	return b
+}
+
+// WithCoop sets the Coop field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Coop field is set to the value of the last call.
+func (b *AppSpecApplyConfiguration) WithCoop(value *CoopConfigApplyConfiguration) *AppSpecApplyConfiguration {
+	b.Coop = value
 	return b
 }

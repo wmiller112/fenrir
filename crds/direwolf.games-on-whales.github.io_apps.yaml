@@ -41,6 +41,22 @@ spec:
                 description: PNG image of the app
                 format: byte
                 type: string
+              coop:
+                description: |-
+                  If set, every user launching the app plays the same running instance
+                  together, like a couch co-op game. All its sessions share one pod and
+                  join one Wolf lobby. The pod takes its resources, volumes and sidecar
+                  policies from the user who started it.
+                properties:
+                  videoProducerBufferCaps:
+                    default: video/x-raw
+                    description: |-
+                      GStreamer caps of the frames the lobby's compositor produces. Must
+                      match what the Wolf encoder pipeline accepts, for example
+                      "video/x-raw(memory:CUDAMemory)" for NVIDIA. The default works with
+                      every encoder but costs a copy per frame.
+                    type: string
+                type: object
               id:
                 description: |-
                   Globally unique ID of the application. If there is a collision, the app
