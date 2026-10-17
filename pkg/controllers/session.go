@@ -1155,6 +1155,7 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 
 			Resources:       pulseAudioResources,
 			SecurityContext: pulseAudioSecurityContext,
+			Lifecycle:       outliveAppOnStop,
 			VolumeMounts: append([]corev1.VolumeMount{
 				{
 					Name:      "wolf-runtime",
@@ -1163,9 +1164,10 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 			}, pulseAudioVolumeMounts...),
 		},
 		corev1.Container{
-			Name:  "wolf",
-			Image: WOLF_IMAGE,
-			Env:   append(wolfEnvVarsSlice, wolfEnv...),
+			Name:      "wolf",
+			Image:     WOLF_IMAGE,
+			Env:       append(wolfEnvVarsSlice, wolfEnv...),
+			Lifecycle: outliveAppOnStop,
 			// Note: Container Ports list is strictly informational. As long
 			// as process is listening on 0.0.0.0 it can be bound by a service.
 			Ports: []corev1.ContainerPort{
@@ -1705,6 +1707,18 @@ func portsForSlot(slot int32) v1alpha1types.SessionPorts {
 		VideoRTP: basePorts.VideoRTP + offset,
 		AudioRTP: basePorts.AudioRTP + offset,
 	}
+}
+
+// When a session's pod stops, Kubernetes signals all its containers at once.
+// Apps like RetroArch save their settings as they quit, which fails if Wolf's
+// display and the audio server are already gone, so those wait this long
+// before being signalled. Well within the default 30s grace period.
+const sidecarStopDelaySeconds = 10
+
+var outliveAppOnStop = &corev1.Lifecycle{
+	PreStop: &corev1.LifecycleHandler{
+		Sleep: &corev1.SleepAction{Seconds: sidecarStopDelaySeconds},
+	},
 }
 
 // Port wolf-agent listens on inside the session pod
