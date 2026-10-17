@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,6 +59,20 @@ func TestAuthenticatedMiddleware(t *testing.T) {
 	for _, path := range []string{"/applist", "/launch"} {
 		if code := request(path, unknown); code != http.StatusUnauthorized {
 			t.Errorf("unknown %s: status %d, want 401", path, code)
+		}
+	}
+}
+
+func TestServerInfoUnpairedForLibgamestream(t *testing.T) {
+	s := &RESTServer{}
+	w := httptest.NewRecorder()
+	s.serverInfoHandler(w, httptest.NewRequest(http.MethodGet, "http://direwolf/serverinfo?uniqueid=x", http.NoBody))
+	body := w.Body.String()
+
+	// libgamestream treats any of these being empty as a broken host
+	for _, want := range []string{"<PairStatus>0</PairStatus>", "<currentgame>0</currentgame>", "<state>SUNSHINE_SERVER_FREE</state>", "<appversion>7."} {
+		if !strings.Contains(body, want) {
+			t.Errorf("serverinfo lacks %s:\n%s", want, body)
 		}
 	}
 }

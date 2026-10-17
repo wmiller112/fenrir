@@ -175,7 +175,9 @@ func (s *RESTServer) serverInfoHandler(w http.ResponseWriter, r *http.Request) {
 	// If this is HTTPS request, print the client certificate
 	pairStatus := 0
 	serverStatus := "SUNSHINE_SERVER_FREE"
-	currentGame := ""
+	// "0" when nothing runs, like GFE and Sunshine. libgamestream clients,
+	// like the Xbox one, reject a serverinfo with an empty currentgame.
+	currentGame := "0"
 
 	if user := r.Context().Value(userContextKey{}); user != nil {
 		user := user.(*v1alpha1types.User)
