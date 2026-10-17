@@ -807,6 +807,15 @@ func (s *RESTServer) authenticatedMiddleware(next http.Handler) http.Handler {
 		fingerprint := hex.EncodeToString(util.Hash(r.TLS.PeerCertificates[0].Raw))
 		pairing, err := s.PairingsLister.Get(fingerprint)
 		if err != nil {
+			// serverinfo answers clients we don't know with PairStatus 0,
+			// which is how Moonlight learns it has to pair again, e.g. after
+			// its Pairing was deleted. Some clients, like the Xbox one, treat
+			// a 401 here as a dead host instead.
+			if r.URL.Path == "/serverinfo" {
+				klog.Infof("Client %s is not paired, sending serverinfo without a user", fingerprint)
+				next.ServeHTTP(w, r)
+				return
+			}
 			writeErrorResponse(w, 401, fmt.Errorf("client %s not paired", fingerprint))
 			return
 		}
