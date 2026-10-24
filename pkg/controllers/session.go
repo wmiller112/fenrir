@@ -65,7 +65,27 @@ type userGame struct {
 type SessionControllerOptions struct {
 	WolfAgentImage string
 	LBSharingKey   string
+
+	// How often to check that each running session still has a client
+	// streaming. When a client disconnects wolf-agent ends its Wolf session,
+	// but nothing about the Session object changes, so without this check its
+	// pod would keep the app running, and the GPU busy, until the user
+	// launches again. Defaults to defaultIdleCheckInterval.
+	IdleCheckInterval time.Duration
 }
+
+const defaultIdleCheckInterval = 30 * time.Second
+
+// A stream that fails to start is retried every streamRetryInterval for
+// streamRetryWindow after its session was created. Nothing else about the
+// session changes once its pod is ready, but wolf-agent can still be
+// unreachable for a moment while its Service endpoint is programmed, and
+// Moonlight gives up on the launch after 25s. After the window, failures fall
+// back to the workqueue's exponential backoff.
+const (
+	streamRetryInterval = 2 * time.Second
+	streamRetryWindow   = 30 * time.Second
+)
 
 // Session Controller manages the lifecycle of a streaming session for
 // a given game, of a given user.
@@ -199,7 +219,41 @@ func (c *SessionController) Run(ctx context.Context) error {
 		}
 	}()
 
+	go c.checkIdleSessions(sessionCtx)
+
 	return c.controller.Run(sessionCtx)
+}
+
+// checkIdleSessions periodically reconciles every session that has started
+// streaming. Reconciling a session whose Wolf session has ended, because its
+// client disconnected, deletes it, and its pod once no other session owns it.
+func (c *SessionController) checkIdleSessions(ctx context.Context) {
+	interval := c.IdleCheckInterval
+	if interval <= 0 {
+		interval = defaultIdleCheckInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		sessions, err := c.SessionInformer.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("Failed to list sessions to check for idle ones: %v", err)
+			continue
+		}
+		for _, session := range sessions {
+			if session.Status.WolfSessionID == "" || session.DeletionTimestamp != nil {
+				continue
+			}
+			c.controller.Enqueue(session.Namespace, session.Name)
+		}
+	}
 }
 
 func (c *SessionController) HasSynced() bool {
@@ -376,7 +430,8 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 	// 	})
 	// }
 
-	if streamError := c.reconcileActiveStreams(context.TODO(), newObj); streamError != nil {
+	streamError := c.reconcileActiveStreams(context.TODO(), newObj)
+	if streamError != nil {
 		klog.Errorf("Failed to reconcile active streams: %s", streamError)
 		meta.SetStatusCondition(&newObj.Status.Conditions, metav1.Condition{
 			Type:    "StreamStarted",
@@ -408,6 +463,14 @@ func (c *SessionController) Reconcile(namespace, name string, newObj *v1alpha1ty
 		if err != nil && !errors.IsNotFound(err) {
 			return err
 		}
+	}
+
+	if streamError != nil {
+		if time.Since(newObj.CreationTimestamp.Time) < streamRetryWindow {
+			c.controller.EnqueueAfter(namespace, name, streamRetryInterval)
+			return nil
+		}
+		return streamError
 	}
 
 	//!TODO: figure our retry logic. Some of these errors surely are retriable
@@ -1056,8 +1119,9 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 		corev1.Container{
 			Name:  "wolf-agent",
 			Image: c.WolfAgentImage,
-			ImagePullPolicy: corev1.PullAlways,
-			// ImagePullPolicy: corev1.PullIfNotPresent,
+			// The image is pinned by digest, so there's nothing to gain from
+			// a registry round trip on every launch, which Moonlight waits on
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Args: []string{
 				"--socket=/etc/wolf/wolf.sock",
 				"--port=8443",
@@ -1111,6 +1175,8 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 					},
 				},wolfAgentEnv...
 			),
+			// Probe often: the stream can't start until the pod is ready, and
+			// Moonlight gives up on the launch after 25s
 			ReadinessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
 					HTTPGet: &corev1.HTTPGetAction{
@@ -1119,6 +1185,7 @@ func (c *SessionController) reconcilePod(ctx context.Context, session *v1alpha1t
 						Scheme: corev1.URISchemeHTTPS,
 					},
 				},
+				PeriodSeconds: 1,
 			},
 			LivenessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{

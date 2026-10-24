@@ -32,6 +32,7 @@ func main() {
 	holderIdentity := flag.String("holder-identity", os.Getenv("POD_NAME"), "Holder identity")
 	namespace := flag.String("namespace", os.Getenv("POD_NAMESPACE"), "Namespace to watch")
 	lbSharingKey := flag.String("lb-sharing-key", os.Getenv("POD_NAMESPACE"), "LoadBalancer sharing key")
+	idleCheckInterval := flag.Duration("idle-check-interval", 30*time.Second, "How often to stop sessions whose client has disconnected")
 	klog.InitFlags(nil)
 	flag.Parse()
 
@@ -85,8 +86,9 @@ func main() {
 		generic.NewInformer[*direwolfv1alpha1.User](userInformer),
 		generic.NewInformer[*appsv1.Deployment](deploymentInformer),
 		controllers.SessionControllerOptions{
-			WolfAgentImage: *wolfAgentImage,
-			LBSharingKey:   *lbSharingKey,
+			WolfAgentImage:    *wolfAgentImage,
+			LBSharingKey:      *lbSharingKey,
+			IdleCheckInterval: *idleCheckInterval,
 		},
 	)
 
