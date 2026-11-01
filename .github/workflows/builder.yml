@@ -2,21 +2,46 @@ name: Build and Push Docker Images
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
 
   release:
     types: [released]
+
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
+  contents: read
   packages: write
 
+env:
+  # Repository variable: Docker Hub namespace (your Docker Hub username or org)
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
+
 jobs:
+  image_tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute image tag (<branch>-<sha>)
+        id: tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Docker tags allow [A-Za-z0-9_.-], max 128 chars, and can't start with . or -
+          slug="$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed -E 's/^[.-]+//' | cut -c1-80)"
+          echo "tag=${slug}-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${slug}-${SHA}"
+
   build_and_push_containers:
     runs-on: ubuntu-latest
+    needs: image_tag
     strategy:
       matrix:
         app:
@@ -35,13 +60,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Login to GitHub Container Registry
+      - name: Login to Docker Hub
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         if: ${{ !github.event.pull_request.head.repo.fork }}
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Generate docker image tags
         id: metadata
@@ -51,7 +75,9 @@ jobs:
             # Disable latest tag
             latest=false
           images: |
-            name=ghcr.io/${{ github.repository_owner }}/fenrir/${{ matrix.app == 'operator' && 'direwolf-operator' || matrix.app }}
+            name=docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.app == 'operator' && 'direwolf-operator' || matrix.app }}
+          tags: |
+            type=raw,value=${{ needs.image_tag.outputs.tag }}
 
       - name: Build and push image
         id: build
@@ -80,7 +106,7 @@ jobs:
 
   build_and_push_chart:
     runs-on: ubuntu-latest
-    needs: build_and_push_containers
+    needs: [image_tag, build_and_push_containers]
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -159,15 +185,15 @@ jobs:
             VALUES_FILE=charts/direwolf-operator/values.yaml
             
             OP_DIGEST="$(cat operator-artifact/image-digest-operator.txt)"
-            yq e -i ".controllers.direwolf_operator.containers.operator.image.repository = \\"ghcr.io/${{ github.repository_owner }}/fenrir/direwolf-operator\\"" "$VALUES_FILE"
-            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ github.ref_name }}@${OP_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/direwolf-operator\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.image.tag = \\"${{ needs.image_tag.outputs.tag }}@${OP_DIGEST}\\"" "$VALUES_FILE"
             
             AG_DIGEST="$(cat agent-artifact/image-digest-wolf-agent.txt)"
-            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"ghcr.io/${{ github.repository_owner }}/fenrir/wolf-agent:${{ github.ref_name }}@${AG_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.direwolf_operator.containers.operator.env.AGENT_IMAGE = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/wolf-agent:${{ needs.image_tag.outputs.tag }}@${AG_DIGEST}\\"" "$VALUES_FILE"
 
             PX_DIGEST="$(cat proxy-artifact/image-digest-moonlight-proxy.txt)"
-            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ github.ref_name }}@${PX_DIGEST}\\"" "$VALUES_FILE"
-            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.repository = \\"ghcr.io/${{ github.repository_owner }}/fenrir/moonlight-proxy\\"" "$VALUES_FILE"
+            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.tag = \\"${{ needs.image_tag.outputs.tag }}@${PX_DIGEST}\\"" "$VALUES_FILE"
+            yq e -i ".controllers.moonlight_proxy.containers.proxy.image.repository = \\"docker.io/${{ env.DOCKERHUB_NAMESPACE }}/moonlight-proxy\\"" "$VALUES_FILE"
             
             echo "Updated $VALUES_FILE"
 

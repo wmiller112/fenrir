@@ -13,6 +13,7 @@ import (
 	"image/png"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -88,6 +89,8 @@ func NewRESTServer(
 	ps.router.HandleFunc("/pair", ps.pairHandler)
 	ps.router.HandleFunc("/unpair", ps.unpairHandler)
 	ps.router.HandleFunc("/pin/", ps.pinHandler)
+	ps.router.HandleFunc("/pin/users", ps.pinUsersHandler)
+	ps.router.HandleFunc("/pin/pending", ps.pinPendingHandler)
 
 	ps.router.HandleFunc("/readyz", ps.readyzHandler)
 	ps.router.HandleFunc("/livez", ps.livezHandler)
@@ -172,7 +175,9 @@ func (s *RESTServer) serverInfoHandler(w http.ResponseWriter, r *http.Request) {
 	// If this is HTTPS request, print the client certificate
 	pairStatus := 0
 	serverStatus := "SUNSHINE_SERVER_FREE"
-	currentGame := ""
+	// "0" when nothing runs, like GFE and Sunshine. libgamestream clients,
+	// like the Xbox one, reject a serverinfo with an empty currentgame.
+	currentGame := "0"
 
 	if user := r.Context().Value(userContextKey{}); user != nil {
 		user := user.(*v1alpha1types.User)
@@ -251,7 +256,9 @@ func (s *RESTServer) pairHandler(w http.ResponseWriter, r *http.Request) {
 		salt := r.URL.Query().Get("salt")
 		clientCertStr := r.URL.Query().Get("clientcert")
 
-		sendXML(w, s.manager.pairPhase1(cacheKey, salt, clientCertStr))
+		deviceName := r.URL.Query().Get("devicename")
+
+		sendXML(w, s.manager.pairPhase1(cacheKey, salt, clientCertStr, deviceName, clientIP))
 		return
 	} else if r.URL.Query().Has("clientchallenge") {
 		klog.Infof("Pairing phase 2 with %s\n", cacheKey)
@@ -315,7 +322,8 @@ func (s *RESTServer) pinHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		type PinRequest struct {
 			Pin    string `json:"pin"`
-			Secret string `secret:"secret"`
+			Secret string `json:"secret"`
+			User   string `json:"user"`
 		}
 
 		var req PinRequest
@@ -325,15 +333,30 @@ func (s *RESTServer) pinHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if req.Pin == "" || req.Secret == "" {
+		if req.Pin == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("Invalid request"))
 			return
 		}
 
+		secret, err := s.resolvePinSecret(req.Secret)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		req.Secret = secret
+
+		username, err := s.resolvePinUser(req.User)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(err.Error()))
+			return
+		}
+
 		// Provide the pin to the pair manager
-		klog.Infof("Received pin %s for secret %s", req.Pin, req.Secret)
-		err := s.manager.PostPin(req.Secret, req.Pin)
+		klog.Infof("Received pin %s for user %s and secret %s", req.Pin, username, req.Secret)
+		err = s.manager.PostPin(req.Secret, req.Pin, username)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))
@@ -346,6 +369,96 @@ func (s *RESTServer) pinHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusBadRequest)
 	w.Write([]byte("Invalid pin request"))
+}
+
+// Lists the Users a client can be paired as, for the PIN page to choose from
+func (s *RESTServer) pinUsersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	names, err := s.userNames()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string][]string{"users": names})
+}
+
+// Lists the pairings waiting for a PIN, so the PIN page works without the
+// secret from the proxy's logs
+func (s *RESTServer) pinPendingHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	pending := s.manager.ListPendingPins()
+	if pending == nil {
+		pending = []PendingPairing{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string][]PendingPairing{"pending": pending})
+}
+
+// Picks the pairing a PIN is for. An empty secret is allowed when exactly one
+// pairing is waiting, e.g. from a bookmarked /pin/ page.
+func (s *RESTServer) resolvePinSecret(secret string) (string, error) {
+	if secret != "" {
+		return secret, nil
+	}
+
+	pending := s.manager.ListPendingPins()
+	switch len(pending) {
+	case 0:
+		return "", fmt.Errorf("no pairing is waiting for a PIN, start pairing in Moonlight first")
+	case 1:
+		return pending[0].Secret, nil
+	default:
+		return "", fmt.Errorf("several pairings are waiting for a PIN, choose one")
+	}
+}
+
+func (s *RESTServer) userNames() ([]string, error) {
+	users, err := s.UserLister.List(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list users: %w", err)
+	}
+
+	names := make([]string, 0, len(users))
+	for _, user := range users {
+		names = append(names, user.Name)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// Picks the User a pairing belongs to. An empty name is allowed when there's
+// exactly one User, so single-user setups don't need to choose.
+func (s *RESTServer) resolvePinUser(name string) (string, error) {
+	if name != "" {
+		if _, err := s.UserLister.Get(name); err != nil {
+			return "", fmt.Errorf("user %q not found", name)
+		}
+		return name, nil
+	}
+
+	names, err := s.userNames()
+	if err != nil {
+		return "", err
+	}
+	switch len(names) {
+	case 0:
+		return "", fmt.Errorf("no users exist to pair with")
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("user required, one of: %s", strings.Join(names, ", "))
+	}
 }
 
 func (s *RESTServer) appListHandler(w http.ResponseWriter, r *http.Request) {
@@ -696,6 +809,15 @@ func (s *RESTServer) authenticatedMiddleware(next http.Handler) http.Handler {
 		fingerprint := hex.EncodeToString(util.Hash(r.TLS.PeerCertificates[0].Raw))
 		pairing, err := s.PairingsLister.Get(fingerprint)
 		if err != nil {
+			// serverinfo answers clients we don't know with PairStatus 0,
+			// which is how Moonlight learns it has to pair again, e.g. after
+			// its Pairing was deleted. Some clients, like the Xbox one, treat
+			// a 401 here as a dead host instead.
+			if r.URL.Path == "/serverinfo" {
+				klog.Infof("Client %s is not paired, sending serverinfo without a user", fingerprint)
+				next.ServeHTTP(w, r)
+				return
+			}
 			writeErrorResponse(w, 401, fmt.Errorf("client %s not paired", fingerprint))
 			return
 		}

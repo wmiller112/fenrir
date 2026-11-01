@@ -54,6 +54,23 @@ type AppSpec struct {
 	// all other volumes must be defined in the pod template's spec.volumes field.
 	// +kubebuilder:validation:Optional
 	VolumeClaimTemplate *v1.PersistentVolumeClaimTemplate `json:"volumeClaimTemplate,omitempty" xml:"-"`
+
+	// If set, every user launching the app plays the same running instance
+	// together, like a couch co-op game. All its sessions share one pod and
+	// join one Wolf lobby. The pod takes its resources, volumes and sidecar
+	// policies from the user who started it.
+	// +kubebuilder:validation:Optional
+	Coop *CoopConfig `json:"coop,omitempty" xml:"-"`
+}
+
+type CoopConfig struct {
+	// GStreamer caps of the frames the lobby's compositor produces. Must
+	// match what the Wolf encoder pipeline accepts, for example
+	// "video/x-raw(memory:CUDAMemory)" for NVIDIA. The default works with
+	// every encoder but costs a copy per frame.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default="video/x-raw"
+	VideoProducerBufferCaps string `json:"videoProducerBufferCaps,omitempty"`
 }
 
 // TODO so I can easily find it

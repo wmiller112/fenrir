@@ -18,6 +18,18 @@
           "format": "byte",
           "type": "string"
         },
+        "coop": {
+          "description": "If set, every user launching the app plays the same running instance\ntogether, like a couch co-op game. All its sessions share one pod and\njoin one Wolf lobby. The pod takes its resources, volumes and sidecar\npolicies from the user who started it.",
+          "properties": {
+            "videoProducerBufferCaps": {
+              "default": "video/x-raw",
+              "description": "GStreamer caps of the frames the lobby's compositor produces. Must\nmatch what the Wolf encoder pipeline accepts, for example\n\"video/x-raw(memory:CUDAMemory)\" for NVIDIA. The default works with\nevery encoder but costs a copy per frame.",
+              "type": "string"
+            }
+          },
+          "type": "object",
+          "additionalProperties": false
+        },
         "id": {
           "description": "Globally unique ID of the application. If there is a collision, the app\nwill be excluded from the list of available apps.",
           "type": "integer"

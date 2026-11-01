@@ -14,7 +14,9 @@ import (
 type Session struct {
 	AppID             string         `json:"app_id,omitempty"`
 	AudioChannelCount int            `json:"audio_channel_count"`
-	ClientID          string         `json:"client_id,omitempty"` // omit, otherwise it throws 'Unhandled exception: stoull'
+	// ID of a paired client, which Wolf names the session after. Omitted when
+	// empty: Wolf can't parse "" ('Unhandled exception: stoull')
+	ClientID          string         `json:"client_id,omitempty"`
 	ClientIP          string         `json:"client_ip"`
 	ClientSettings    ClientSettings `json:"client_settings,omitempty"`
 	VideoHeight       int            `json:"video_height"`
@@ -53,6 +55,10 @@ type Client interface {
 	StopSession(ctx context.Context, sessionID string) error
 	ListSessions(ctx context.Context) ([]Session, error)
 	ListApps(ctx context.Context) ([]App, error)
+	ListPairedClients(ctx context.Context) ([]PairedClient, error)
+	ListLobbies(ctx context.Context) ([]Lobby, error)
+	CreateLobby(ctx context.Context, lobby CreateLobbyRequest) (string, error)
+	JoinLobby(ctx context.Context, lobbyID, sessionID string) error
 	SubscribeToEvents(ctx context.Context) (<-chan *sse.Event, error)
 }
 
@@ -304,7 +310,14 @@ type AppsResponse struct {
 type WolfEventType string
 const (
 	PauseStreamEventType WolfEventType = "wolf::core::events::PauseStreamEvent"
+	// Fired when a client's video stream is set up. Its pipeline starts once
+	// the client's first RTP ping arrives.
+	VideoSessionEventType WolfEventType = "wolf::core::events::VideoSession"
 )
+
+type VideoSessionEvent struct {
+	SessionID string `json:"session_id"`
+}
 
 type PauseStreamEvent struct {
 	SessionID string `json:"session_id"`

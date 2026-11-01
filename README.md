@@ -89,6 +89,28 @@ User's Game Container MUST have a pre-launch script that waits for the `WAYLAND_
 socket to be created, otherwise the container will be in a crashloop, and the
 Pod will never be `READY` for the `Service` to forward traffic to it.
 
+### Co-op Apps
+
+An `App` with `spec.coop` set is played together: every user launching it
+streams the same running instance, for games without netplay like PS2
+(see `examples/ps2-coop.yaml`).
+
+- All its sessions share one pod (`coop-<app>`), Service and port slot,
+  whoever launched them. The pod is owned by every session, so it outlives the
+  first player leaving, and it uses the resources, volumes and sidecar
+  policies of the user who started it.
+- The operator starts a Wolf lobby named `direwolf-<app>` in the pod, on the
+  render node its Wolf uses (`WOLF_RENDER_NODE`), before handing Moonlight the
+  stream. wolf-agent joins each session to it once that session's stream is
+  running, since Wolf only switches streams that already run. Wolf then
+  streams the lobby's display to every client and routes all their inputs to
+  it. The lobby lives as long as the pod.
+- The game runs as the pod's own container, not as Wolf's runner, so the
+  lobby's runner only links the lobby's Wayland socket to `direwolf-lobby` and
+  writes its audio sink name to `direwolf-lobby-sink`, both in
+  `XDG_RUNTIME_DIR`. The app container gets `WAYLAND_DISPLAY=direwolf-lobby`
+  and must read `PULSE_SINK` from that file.
+
 ### Port Forwarding
 
 Port forwarding to the container is the lynchpin of this POC. And it actually
